@@ -744,7 +744,7 @@ def main() -> None:
         metavar="URL",
         help=(
             "Also publish the deck to a hosted display, e.g. "
-            "https://your-app.vercel.app/api/push. Requires SLIDEX_PUSH_TOKEN."
+            "https://your-app.vercel.app/api/slides. Requires SLIDEX_PUSH_TOKEN."
         ),
     )
     parser.add_argument(

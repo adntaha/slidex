@@ -39,9 +39,15 @@ Neither can live in a request-scoped serverless function, so `slidex.py` keeps
 running where the microphone is and Vercel hosts the display for everyone else.
 
 ```
-your machine                          Vercel                   viewers
-slidex.py --microphone --push  ──POST──▶ /api/push ──▶ KV ──▶ /api/slides ──▶ browser
+ your machine                    Vercel                    viewers
+ slidex.py --push  ──POST──▶  /api/slides  ◀──GET──  browser
+ (mic + Realtime)                  │
+                                   ▼
+                                   KV
 ```
+
+One function serves both directions: the capture machine POSTs the deck, the
+audience GETs it.
 
 The project deploys as-is with the Python preset: `api/*.py` become functions
 and `public/` is served statically.
@@ -50,14 +56,14 @@ and `public/` is served statically.
    marketplace). Functions share no memory, so the deck has to live outside
    them. The integration sets `KV_REST_API_URL` and `KV_REST_API_TOKEN`;
    `UPSTASH_REDIS_REST_URL` / `_TOKEN` are accepted too.
-2. Set `SLIDEX_PUSH_TOKEN` to a secret of your choosing. `/api/push` fails
+2. Set `SLIDEX_PUSH_TOKEN` to a secret of your choosing. `POST /api/slides` fails
    closed, so until this exists nothing can publish.
 3. `vercel deploy`.
 4. Run the capture side with the same secret:
 
 ```bash
 export SLIDEX_PUSH_TOKEN=the-same-secret
-pipenv run python slidex.py --microphone --web --push https://your-app.vercel.app/api/push
+pipenv run python slidex.py --microphone --web --push https://your-app.vercel.app/api/slides
 ```
 
 `--web` stays useful as your own local monitor; `--push` mirrors the deck for
@@ -68,7 +74,7 @@ off the Realtime event loop.
 | --- | --- |
 | `GET /` | the deck UI, from `public/index.html` |
 | `GET /api/slides` | current deck; `503` if the store is unreachable |
-| `POST /api/push` | publish a deck; `Authorization: Bearer $SLIDEX_PUSH_TOKEN` |
+| `POST /api/slides` | publish a deck; `Authorization: Bearer $SLIDEX_PUSH_TOKEN` |
 
 Without a KV store the routes fall back to per-instance memory. That is fine
 for `vercel dev` but will not hold a deck across invocations in production.
