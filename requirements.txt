@@ -1,0 +1,4 @@
+# The api/ routes are deliberately standard-library only, so there is nothing
+# for Vercel to install. Keeping this file present stops the Python builder
+# from falling back to Pipfile.lock, which pins sounddevice -- that needs the
+# PortAudio system headers and cannot build in the serverless image.

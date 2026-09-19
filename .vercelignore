@@ -1,0 +1,7 @@
+# Only api/ and public/ belong in the deployment. main.py is the local capture
+# program: it needs PortAudio and a microphone, neither of which exist there.
+main.py
+Pipfile
+Pipfile.lock
+__pycache__
+.claude

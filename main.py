@@ -372,7 +372,7 @@ class DeckRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         if self.path == "/":
-            body = Path(__file__).with_name("index.html").read_bytes()
+            body = (Path(__file__).parent / "public" / "index.html").read_bytes()
             self._send(200, "text/html; charset=utf-8", body)
         elif self.path == "/api/slides":
             body = json.dumps(deck_snapshot()).encode("utf-8")
@@ -398,6 +398,40 @@ def start_web_server(port: int) -> ThreadingHTTPServer:
     threading.Thread(target=server.serve_forever, daemon=True, name="deck-web-server").start()
     trace(f"Deck display ready at http://127.0.0.1:{port}")
     return server
+
+
+def start_deck_publisher(endpoint: str, token: str, interval: float = 0.4) -> threading.Event:
+    """Mirror the deck to a hosted display for viewers who are not on this machine.
+
+    Polls the local snapshot and POSTs only when it changes. This runs on its own
+    thread on purpose: the upload must never sit in front of the Realtime event
+    loop, and coalescing here keeps a burst of edits to a single request.
+    """
+    stop = threading.Event()
+
+    def publish() -> None:
+        published: bytes | None = None
+        while not stop.wait(interval):
+            body = json.dumps(deck_snapshot()).encode()
+            if body == published:
+                continue
+            request = Request(
+                endpoint,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            )
+            try:
+                with urlopen(request, timeout=10) as response:  # noqa: S310 - operator-supplied endpoint
+                    response.read()
+            except OSError as exc:
+                trace(f"PUSH FAILED: {exc}")
+                continue
+            published = body
+
+    threading.Thread(target=publish, daemon=True, name="deck-publisher").start()
+    trace(f"Publishing the deck to {endpoint}")
+    return stop
 
 
 class RealtimeToolClient:
@@ -706,6 +740,14 @@ def main() -> None:
         help="Localhost port for --web (default: 8000).",
     )
     parser.add_argument(
+        "--push",
+        metavar="URL",
+        help=(
+            "Also publish the deck to a hosted display, e.g. "
+            "https://your-app.vercel.app/api/push. Requires SLIDEX_PUSH_TOKEN."
+        ),
+    )
+    parser.add_argument(
         "--chunk-seconds",
         type=float,
         default=0.5,
@@ -722,7 +764,12 @@ def main() -> None:
     if args.chunk_seconds <= 0:
         parser.error("--chunk-seconds must be greater than zero")
 
+    push_token = os.environ.get("SLIDEX_PUSH_TOKEN", "")
+    if args.push and not push_token:
+        parser.error("--push needs SLIDEX_PUSH_TOKEN set to the same secret as the deployment")
+
     web_server = start_web_server(args.web_port) if args.web else None
+    stop_publisher = start_deck_publisher(args.push, push_token) if args.push else None
     client = RealtimeToolClient(api_key)
     try:
         if args.microphone:
@@ -736,6 +783,8 @@ def main() -> None:
     finally:
         client.close()
         IMAGE_WORKERS.shutdown(wait=False, cancel_futures=True)
+        if stop_publisher is not None:
+            stop_publisher.set()
         if web_server is not None:
             web_server.shutdown()
             web_server.server_close()

@@ -245,7 +245,9 @@ document.addEventListener("keydown", event => {
 
 async function refresh() {
   try {
-    const response = await fetch("/api/slides", { cache: "no-store" });
+    // Without a deadline a hosted API that hangs rather than refuses would leave
+    // the page claiming LIVE indefinitely.
+    const response = await fetch("/api/slides", { cache: "no-store", signal: AbortSignal.timeout(4000) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
     statusLabel.textContent = "LIVE / LISTENING";
