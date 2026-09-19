@@ -50,14 +50,28 @@ def current_slide() -> dict[str, Any] | None:
     return SLIDES[-1] if SLIDES else None
 
 
+def current_content_slide() -> dict[str, Any] | None:
+    """Return the most recent slide that can receive speaker notes."""
+    for slide in reversed(SLIDES):
+        if slide.get("kind") != "title":
+            return slide
+    return None
+
+
 def slide_state() -> dict[str, Any]:
     """Return enough state for the model to choose its next deck-editing action."""
     with DECK_LOCK:
-        slide = current_slide()
+        slide = current_content_slide()
+        has_title_slide = any(item.get("kind") == "title" for item in SLIDES)
         if slide is None:
-            return {"slide_count": 0, "current_slide": None}
+            return {
+                "slide_count": len(SLIDES),
+                "has_title_slide": has_title_slide,
+                "current_slide": None,
+            }
         return {
             "slide_count": len(SLIDES),
+            "has_title_slide": has_title_slide,
             "current_slide": {
                 "number": len(SLIDES),
                 "title": slide["title"],
@@ -71,10 +85,33 @@ def deck_snapshot() -> dict[str, Any]:
     with DECK_LOCK:
         return {
             "slides": [
-                {"number": index, "title": slide["title"], "bullets": list(slide["bullets"])}
+                {
+                    "number": index,
+                    "kind": slide.get("kind", "content"),
+                    "title": slide["title"],
+                    "bullets": list(slide["bullets"]),
+                }
                 for index, slide in enumerate(SLIDES, start=1)
             ]
         }
+
+
+def create_title_slide(title: str) -> dict[str, Any]:
+    """Create the deck's opening title slide once a clear topic is known."""
+    with DECK_LOCK:
+        cleaned = title.strip()
+        if not cleaned:
+            return {"status": "ignored", "reason": "A title is required.", **slide_state()}
+        if any(slide.get("kind") == "title" for slide in SLIDES):
+            return {
+                "status": "ignored",
+                "reason": "The opening title slide already exists.",
+                **slide_state(),
+            }
+        # Recover gracefully if content arrived before the model could name the topic.
+        SLIDES.insert(0, {"kind": "title", "title": cleaned, "bullets": []})
+        trace(f"TITLE SLIDE: {cleaned}")
+        return {"status": "created", **slide_state()}
 
 
 def create_new_slide(title: str) -> dict[str, Any]:
@@ -84,7 +121,7 @@ def create_new_slide(title: str) -> dict[str, Any]:
         if not cleaned:
             return {"status": "ignored", "reason": "A slide title is required.", **slide_state()}
 
-        SLIDES.append({"title": cleaned, "bullets": []})
+        SLIDES.append({"kind": "content", "title": cleaned, "bullets": []})
         trace(f"NEW SLIDE #{len(SLIDES)}: {cleaned}")
         return {"status": "created", **slide_state()}
 
@@ -96,16 +133,16 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
         if not cleaned:
             return {"status": "ignored", "reason": "The bullet point was empty.", **slide_state()}
 
-        if current_slide() is None:
+        if current_content_slide() is None:
             if not slide_title:
                 return {
                     "status": "ignored",
-                    "reason": "Create a titled slide before adding its first bullet.",
+                    "reason": "Create a content slide before adding its first bullet.",
                     **slide_state(),
                 }
             create_new_slide(slide_title)
 
-        slide = current_slide()
+        slide = current_content_slide()
         assert slide is not None
         slide["bullets"].append(cleaned)
         trace(f"BULLET #{len(slide['bullets'])}: • {cleaned}")
@@ -115,7 +152,7 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
 def update_bullet_point(bullet_number: int, bullet_point: str) -> dict[str, Any]:
     """Replace a current-slide bullet when later speech refines or corrects it."""
     with DECK_LOCK:
-        slide = current_slide()
+        slide = current_content_slide()
         cleaned = bullet_point.strip().lstrip("-• \t")
         if slide is None:
             return {"status": "ignored", "reason": "There is no active slide.", **slide_state()}
@@ -136,12 +173,32 @@ def update_bullet_point(bullet_number: int, bullet_point: str) -> dict[str, Any]
 
 TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "get_current_time": get_current_time,
+    "create_title_slide": create_title_slide,
     "create_new_slide": create_new_slide,
     "new_bullet_point": new_bullet_point,
     "update_bullet_point": update_bullet_point,
 }
 
 TOOLS = [
+    {
+        "type": "function",
+        "name": "create_title_slide",
+        "description": (
+            "Create the opening title slide once the speaker's initial topic is clear. "
+            "Call this only when has_title_slide is false; do not call it again until the deck resets."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "A concise presentation title that captures the speaker's topic.",
+                }
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
     {
         "type": "function",
         "name": "get_current_time",
@@ -315,9 +372,14 @@ class RealtimeToolClient:
                     },
                     "instructions": (
                         "You are a real-time slide-deck editor. Build a coherent deck "
-                        "from the speaker's ideas using tools, not visible text. Start "
-                        "the first clear topic with create_new_slide, or provide "
-                        "slide_title on its first new_bullet_point. Add a concise, "
+                        "from the speaker's ideas using tools, not visible text. As soon "
+                        "as the opening topic is clear, first call create_title_slide with "
+                        "a concise presentation title. Then, when there is a substantive "
+                        "point, create a separate content slide with create_new_slide "
+                        "before adding bullets. Do not make the title slide from a greeting, "
+                        "filler, or an unclear fragment. Call create_title_slide exactly "
+                        "once per deck: after its tool result reports has_title_slide true, "
+                        "never call it again unless the deck has been reset. Add a concise, "
                         "standalone bullet only for substantive, sufficiently complete "
                         "ideas. Do not add bullets for filler, false starts, or "
                         "repetition. When later speech corrects or meaningfully refines "
