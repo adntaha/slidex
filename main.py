@@ -164,7 +164,7 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
             continued_title = slide["title"]
             if not continued_title.lower().endswith("(continued)"):
                 continued_title = f"{continued_title} (continued)"
-            SLIDES.append({"kind": "content", "title": continued_title, "bullets": []})
+            SLIDES.append(new_slide("content", continued_title))
             slide = current_content_slide()
             assert slide is not None
             continued = True
@@ -177,7 +177,7 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
         # newly created content slide text-only just because it skipped them.
         if "image" not in slide and not slide.get("image_search_attempted"):
             slide["image_search_attempted"] = True
-            image_result = search_image(slide["title"])
+            image_result = search_image(f"{slide['title']} {cleaned}")
             if image_result.get("status") == "found":
                 image_id = image_result["image_id"]
                 integration = integrate_image(image_id, "right")
@@ -367,8 +367,8 @@ TOOLS = [
         "type": "function",
         "name": "new_bullet_point",
         "description": (
-            "Create one concise, standalone bullet point from a substantive "
-            "idea the user just expressed in a speech segment."
+            "Create one concise, standalone bullet only from a clearly heard, explicit "
+            "statement by the main speaker. Do not infer missing facts or themes."
         ),
         "parameters": {
             "type": "object",
@@ -504,8 +504,16 @@ class RealtimeToolClient:
                         }
                     },
                     "instructions": (
-                        "You are a real-time slide-deck editor. Build a coherent deck "
-                        "from the speaker's ideas using tools, not visible text. As soon "
+                        "You are a conservative, evidence-only real-time slide-deck editor. "
+                        "Build a coherent deck only from the main speaker's clearly heard, "
+                        "explicit ideas using tools, not visible text. Never invent, assume, "
+                        "or add a theme, fact, entity, relationship, or motivation the speaker "
+                        "did not state. Background conversations, television, ambient speech, "
+                        "noise, partial phrases, and uncertain audio are not deck content. If "
+                        "you are not highly confident the statement is from the main speaker and "
+                        "can be recorded without adding meaning, make no tool call. Do not "
+                        "reinterpret a statement through the lens of the current slide's topic. "
+                        "As soon "
                         "as the opening topic is clear, first call create_title_slide with "
                         "a concise presentation title. Then, when there is a substantive "
                         "point, create a separate content slide with create_new_slide "
@@ -520,7 +528,10 @@ class RealtimeToolClient:
                         "adding a duplicate. When one coherent topic is finished and "
                         "the speaker begins a genuinely new topic, call "
                         "create_new_slide with a short title before adding that topic's "
-                        "bullets. Keep content slides to five bullets maximum. If the "
+                        "bullets. Treat a clear, explicitly stated change of subject, entity, timeframe, or "
+                        "question as a new topic; do not force it into the current slide or "
+                        "rewrite a current bullet merely because it was the latest one. "
+                        "Keep content slides to five bullets maximum. If the "
                         "same topic needs another point after five bullets, start a new "
                         "slide titled with the previous title plus ' (continued)'. Do not "
                         "make a new slide merely because of a pause. "
@@ -751,8 +762,8 @@ def main() -> None:
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=0.25,
-        help="Seconds of continuous microphone audio before each deck decision (default: 0.25).",
+        default=0.5,
+        help="Seconds of continuous microphone audio before each deck decision (default: 0.5).",
     )
     args = parser.parse_args()
 
