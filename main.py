@@ -17,10 +17,13 @@ import logging
 import os
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import websocket
 
@@ -43,7 +46,17 @@ def get_current_time(timezone: str = "UTC") -> dict[str, str]:
 
 
 SLIDES: list[dict[str, Any]] = []
+IMAGE_RESULTS: dict[str, dict[str, str]] = {}
 DECK_LOCK = threading.RLock()
+_LAST_SLIDE_ID = 0
+
+
+def new_slide(kind: str, title: str) -> dict[str, Any]:
+    """Build a slide with an id that survives the renumbering an insert causes."""
+    global _LAST_SLIDE_ID
+    with DECK_LOCK:
+        _LAST_SLIDE_ID += 1
+        return {"id": _LAST_SLIDE_ID, "kind": kind, "title": title, "bullets": []}
 
 
 def current_slide() -> dict[str, Any] | None:
@@ -86,10 +99,12 @@ def deck_snapshot() -> dict[str, Any]:
         return {
             "slides": [
                 {
+                    "id": slide["id"],
                     "number": index,
                     "kind": slide.get("kind", "content"),
                     "title": slide["title"],
                     "bullets": list(slide["bullets"]),
+                    "image": slide.get("image"),
                 }
                 for index, slide in enumerate(SLIDES, start=1)
             ]
@@ -109,7 +124,7 @@ def create_title_slide(title: str) -> dict[str, Any]:
                 **slide_state(),
             }
         # Recover gracefully if content arrived before the model could name the topic.
-        SLIDES.insert(0, {"kind": "title", "title": cleaned, "bullets": []})
+        SLIDES.insert(0, new_slide("title", cleaned))
         trace(f"TITLE SLIDE: {cleaned}")
         return {"status": "created", **slide_state()}
 
@@ -121,7 +136,7 @@ def create_new_slide(title: str) -> dict[str, Any]:
         if not cleaned:
             return {"status": "ignored", "reason": "A slide title is required.", **slide_state()}
 
-        SLIDES.append({"kind": "content", "title": cleaned, "bullets": []})
+        SLIDES.append(new_slide("content", cleaned))
         trace(f"NEW SLIDE #{len(SLIDES)}: {cleaned}")
         return {"status": "created", **slide_state()}
 
@@ -144,9 +159,37 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
 
         slide = current_content_slide()
         assert slide is not None
+        continued = False
+        if len(slide["bullets"]) >= 5:
+            continued_title = slide["title"]
+            if not continued_title.lower().endswith("(continued)"):
+                continued_title = f"{continued_title} (continued)"
+            SLIDES.append({"kind": "content", "title": continued_title, "bullets": []})
+            slide = current_content_slide()
+            assert slide is not None
+            continued = True
+            trace(f"CONTINUED SLIDE #{len(SLIDES)}: {continued_title}")
         slide["bullets"].append(cleaned)
         trace(f"BULLET #{len(slide['bullets'])}: • {cleaned}")
-        return {"status": "saved", "bullet_number": len(slide["bullets"]), **slide_state()}
+        image_added = False
+        image_id: str | None = None
+        # The model may still call the image tools itself, but do not leave a
+        # newly created content slide text-only just because it skipped them.
+        if "image" not in slide and not slide.get("image_search_attempted"):
+            slide["image_search_attempted"] = True
+            image_result = search_image(slide["title"])
+            if image_result.get("status") == "found":
+                image_id = image_result["image_id"]
+                integration = integrate_image(image_id, "right")
+                image_added = integration.get("status") == "integrated"
+        return {
+            "status": "saved",
+            "bullet_number": len(slide["bullets"]),
+            "continued": continued,
+            "image_added": image_added,
+            "image_id": image_id,
+            **slide_state(),
+        }
 
 
 def update_bullet_point(bullet_number: int, bullet_point: str) -> dict[str, Any]:
@@ -171,15 +214,105 @@ def update_bullet_point(bullet_number: int, bullet_point: str) -> dict[str, Any]
         return {"status": "updated", "bullet_number": bullet_number, **slide_state()}
 
 
+def search_image(query: str) -> dict[str, Any]:
+    """Find one reusable, topic-relevant image from Wikimedia Commons."""
+    cleaned = query.strip()
+    if not cleaned:
+        return {"status": "ignored", "reason": "An image search query is required."}
+    params = urlencode(
+        {
+            "action": "query",
+            "format": "json",
+            "generator": "search",
+            "gsrsearch": cleaned,
+            "gsrnamespace": "6",
+            "gsrlimit": "8",
+            "prop": "imageinfo",
+            "iiprop": "url|extmetadata",
+            "iiurlwidth": "1600",
+        }
+    )
+    request = Request(
+        f"https://commons.wikimedia.org/w/api.php?{params}",
+        headers={"User-Agent": "Slidex/1.0 (local presentation tool)"},
+    )
+    try:
+        with urlopen(request, timeout=12) as response:  # noqa: S310 - fixed Wikimedia API endpoint
+            pages = json.load(response).get("query", {}).get("pages", {}).values()
+    except OSError as exc:
+        return {"status": "unavailable", "reason": f"Image search failed: {exc}"}
+
+    for page in pages:
+        info = next(iter(page.get("imageinfo", [])), {})
+        image_url = info.get("thumburl") or info.get("url")
+        if not image_url:
+            continue
+        image_id = f"image_{uuid.uuid4().hex[:12]}"
+        result = {
+            "id": image_id,
+            "url": image_url,
+            "alt": page.get("title", "").removeprefix("File:"),
+            "source": f"https://commons.wikimedia.org/wiki/{page.get('title', '').replace(' ', '_')}",
+        }
+        with DECK_LOCK:
+            IMAGE_RESULTS[image_id] = result
+        trace(f"IMAGE FOUND {image_id}: {cleaned}")
+        return {"status": "found", "image_id": image_id, "query": cleaned, **result}
+    return {"status": "not_found", "query": cleaned}
+
+
+def integrate_image(image_id: str, placement: str) -> dict[str, Any]:
+    """Place a previously found image on the current content slide."""
+    with DECK_LOCK:
+        image = IMAGE_RESULTS.get(image_id)
+        slide = current_content_slide()
+        if image is None:
+            return {"status": "ignored", "reason": "That image ID is unavailable.", **slide_state()}
+        if slide is None:
+            return {"status": "ignored", "reason": "There is no content slide to illustrate.", **slide_state()}
+        if placement not in {"background", "left", "right"}:
+            return {"status": "ignored", "reason": "Placement must be background, left, or right.", **slide_state()}
+        slide["image"] = {**image, "placement": placement}
+        trace(f"IMAGE INTEGRATED {image_id} / {placement}")
+        return {"status": "integrated", "image_id": image_id, "placement": placement, **slide_state()}
+
+
 TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "get_current_time": get_current_time,
     "create_title_slide": create_title_slide,
     "create_new_slide": create_new_slide,
     "new_bullet_point": new_bullet_point,
     "update_bullet_point": update_bullet_point,
+    "search_image": search_image,
+    "integrate_image": integrate_image,
 }
 
 TOOLS = [
+    {
+        "type": "function",
+        "name": "search_image",
+        "description": "Find a real, relevant image for the current slide. Use only when a visual materially improves the slide.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "A precise Wikimedia Commons image search query."}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "integrate_image",
+        "description": "Place an image returned by search_image on the current content slide.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_id": {"type": "string", "description": "The image_id returned by search_image."},
+                "placement": {"type": "string", "enum": ["background", "left", "right"], "description": "How the image should compose with the slide text."},
+            },
+            "required": ["image_id", "placement"],
+            "additionalProperties": False,
+        },
+    },
     {
         "type": "function",
         "name": "create_title_slide",
@@ -387,7 +520,15 @@ class RealtimeToolClient:
                         "adding a duplicate. When one coherent topic is finished and "
                         "the speaker begins a genuinely new topic, call "
                         "create_new_slide with a short title before adding that topic's "
-                        "bullets. Do not make a new slide merely because of a pause. "
+                        "bullets. Keep content slides to five bullets maximum. If the "
+                        "same topic needs another point after five bullets, start a new "
+                        "slide titled with the previous title plus ' (continued)'. Do not "
+                        "make a new slide merely because of a pause. "
+                        "Every content slide should have one relevant real image unless an "
+                        "image would be misleading. Prefer calling search_image with a "
+                        "precise query, then call integrate_image with the returned image_id. "
+                        "Use background for atmospheric visuals and left or right when the "
+                        "image should sit beside readable text. Never invent an image_id. "
                         "Prefer tool calls over text responses."
                     ),
                     "tools": TOOLS,
