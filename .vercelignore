@@ -1,6 +1,10 @@
-# Only api/ and public/ belong in the deployment. main.py is the local capture
+# Only api/ and public/ belong in the deployment. slidex.py is the local capture
 # program: it needs PortAudio and a microphone, neither of which exist there.
-main.py
+#
+# It is also deliberately not called main.py -- Vercel's Python preset treats a
+# root main.py/app.py/index.py/server.py as the app entrypoint and fails the
+# build when it does not export `app` or `handler`.
+slidex.py
 Pipfile
 Pipfile.lock
 __pycache__

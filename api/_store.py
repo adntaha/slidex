@@ -1,7 +1,7 @@
 """Deck storage shared by the hosted API routes.
 
 Vercel functions are request-scoped and do not share memory, so the deck cannot
-live in a module global the way it does in ``main.py``. It lives in a
+live in a module global the way it does in ``slidex.py``. It lives in a
 Redis-compatible KV store reached over plain HTTPS instead, which keeps these
 routes dependency-free.
 

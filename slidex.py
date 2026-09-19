@@ -5,7 +5,7 @@ calling the local tools in ``TOOL_HANDLERS``. A tiny HTTP server publishes the
 deck to ``index.html``, which polls it and animates the changes.
 
 Set OPENAI_API_KEY, then run:
-    pipenv run python main.py --microphone --web
+    pipenv run python slidex.py --microphone --web
 """
 
 from __future__ import annotations

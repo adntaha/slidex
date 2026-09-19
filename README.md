@@ -10,7 +10,7 @@ slides are illustrated automatically from Wikimedia Commons.
 ```bash
 pipenv install
 export OPENAI_API_KEY=sk-...
-pipenv run python main.py --microphone --web
+pipenv run python slidex.py --microphone --web
 ```
 
 Then open <http://127.0.0.1:8000>. Use `←`/`→`, `Space`, or the on-screen
@@ -35,12 +35,12 @@ libportaudio2` on Debian/Ubuntu).
 
 The microphone (Bluetooth or otherwise) pairs to a host machine's audio stack,
 and the Realtime session is a WebSocket held open for the length of a talk.
-Neither can live in a request-scoped serverless function, so `main.py` keeps
+Neither can live in a request-scoped serverless function, so `slidex.py` keeps
 running where the microphone is and Vercel hosts the display for everyone else.
 
 ```
 your machine                          Vercel                   viewers
-main.py --microphone --push  ──POST──▶ /api/push ──▶ KV ──▶ /api/slides ──▶ browser
+slidex.py --microphone --push  ──POST──▶ /api/push ──▶ KV ──▶ /api/slides ──▶ browser
 ```
 
 The project deploys as-is with the Python preset: `api/*.py` become functions
@@ -57,7 +57,7 @@ and `public/` is served statically.
 
 ```bash
 export SLIDEX_PUSH_TOKEN=the-same-secret
-pipenv run python main.py --microphone --web --push https://your-app.vercel.app/api/push
+pipenv run python slidex.py --microphone --web --push https://your-app.vercel.app/api/push
 ```
 
 `--web` stays useful as your own local monitor; `--push` mirrors the deck for
@@ -73,13 +73,16 @@ off the Realtime event loop.
 Without a KV store the routes fall back to per-instance memory. That is fine
 for `vercel dev` but will not hold a deck across invocations in production.
 
-`.vercelignore` keeps `main.py` and the Pipfile out of the build: the Pipfile
-pins `sounddevice`, which needs the PortAudio system headers and cannot compile
-in the serverless image. The `api/` routes are standard library only.
+The capture program is called `slidex.py`, not `main.py`, on purpose: Vercel's
+Python preset treats a root-level `main.py` as the app entrypoint and fails the
+build because it exports no `app` or `handler`. `.vercelignore` keeps it and the
+Pipfile out of the deployment anyway — the Pipfile pins `sounddevice`, which
+needs the PortAudio system headers and cannot compile in the serverless image.
+The `api/` routes are standard library only.
 
 ## How it fits together
 
-- `main.py` — deck state and the tool handlers the model calls, a tiny HTTP
+- `slidex.py` — deck state and the tool handlers the model calls, a tiny HTTP
   server exposing `GET /api/slides`, the Realtime WebSocket client, and the
   optional publisher that mirrors the deck to a deployment.
 - `public/index.html` — polls `/api/slides` twice a second and diffs the deck into
