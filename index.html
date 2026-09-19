@@ -1,22 +1,262 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LIVE DECK</title>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slidex</title>
 <style>
-.slide.has-image::after{content:"";position:absolute;inset:0;z-index:0;pointer-events:none}.slide-image{z-index:0}.image-credit{display:none;position:absolute;z-index:2;bottom:16px;right:20px;max-width:45%;padding:4px 7px;background:#ffffffe6;color:#3c4043;font-size:.62rem;line-height:1.1;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.has-image .image-credit{display:block}.slide.has-image h2{font-size:clamp(1.8rem,4.8vw,5rem)}.slide.has-image ul{margin-top:clamp(18px,3.5vh,42px);gap:clamp(8px,1.2vh,15px)}.slide.has-image li{font-size:clamp(.95rem,1.55vw,1.35rem)}
-.slide-content{position:relative;z-index:1}.slide-image{display:none}.slide.has-image .slide-image{display:block}.image-background .slide-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.24}.image-background::after{content:"";position:absolute;inset:0;background:#fff9}.image-left .slide-image,.image-right .slide-image{position:absolute;top:15%;width:36%;height:70%;object-fit:cover}.image-left .slide-image{left:8%}.image-right .slide-image{right:8%}.image-left .slide-content{margin-left:38%}.image-right .slide-content{max-width:55%}
-:root{color:#202124;background:#f1f3f4;font-family:Arial,Helvetica,sans-serif}*{box-sizing:border-box}body{min-height:100vh;margin:0;background:#f1f3f4}header{height:54px;padding:0 22px;display:flex;align-items:center;justify-content:space-between;background:#fff;border-bottom:1px solid #dadce0}h1,h2,p{margin:0}h1{color:#5f6368;font-size:.78rem;letter-spacing:.08em}#status{color:#188038;font:700 .7rem "Courier New",monospace}#stage{min-height:calc(100vh - 54px);padding:clamp(18px,4vh,46px) clamp(14px,6vw,96px) 76px;display:grid;place-items:center}main{width:min(100%,1240px);aspect-ratio:16/9;position:relative;background:#fff;box-shadow:0 3px 15px #2021242b;overflow:hidden}.slide{position:absolute;inset:0;padding:clamp(30px,6vw,104px);display:grid;grid-template-columns:74px 1fr;gap:clamp(20px,3vw,46px);align-content:center;opacity:0;pointer-events:none;transform:translateX(5%);transition:opacity 260ms ease,transform 360ms cubic-bezier(.2,.8,.2,1)}.slide.is-active{opacity:1;pointer-events:auto;transform:translateX(0)}.slide.is-new.is-active{animation:slide-in 480ms cubic-bezier(.16,1,.3,1)}.slide-number{color:#5f6368;font:700 clamp(.65rem,1.1vw,.9rem) "Courier New",monospace;letter-spacing:.08em;border-right:1px solid #dadce0;padding-top:.5em}.slide-content{min-width:0}h2{max-width:18ch;font-size:clamp(2rem,6.2vw,6.5rem);line-height:.94;letter-spacing:-.065em;font-weight:700}ul{margin:clamp(24px,5vh,62px) 0 0;padding:0;list-style:none;display:grid;gap:clamp(11px,1.7vh,21px);max-width:60ch}li{color:#3c4043;font-size:clamp(1rem,2vw,1.7rem);line-height:1.2;display:grid;grid-template-columns:18px 1fr;gap:12px}li::before{content:"•";color:#4285f4;font-size:1.35em;line-height:.75}.title-slide{grid-template-columns:1fr}.title-slide .slide-number,.title-slide ul{display:none}.title-slide h2{max-width:14ch;font-size:clamp(3.1rem,9vw,9.5rem)}.title-slide h2::after{content:"LIVE PRESENTATION";display:block;margin-top:1.5rem;color:#4285f4;font-size:.12em;letter-spacing:.12em}li.is-new{animation:item-in 360ms cubic-bezier(.16,1,.3,1) both}.is-edited{animation:edited 700ms ease-out}.empty{width:100%;height:100%;display:grid;place-items:center;color:#5f6368;font-size:clamp(1.2rem,3vw,2.2rem)}#controls{position:fixed;z-index:2;bottom:18px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px;border:1px solid #dadce0;border-radius:24px;background:#fff;box-shadow:0 2px 8px #20212420}button{width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:#3c4043;cursor:pointer;font-size:1.4rem}button:hover:not(:disabled){background:#f1f3f4}button:disabled{color:#bdc1c6;cursor:default}#position{min-width:54px;color:#5f6368;font: .75rem "Courier New",monospace;text-align:center}@keyframes slide-in{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}@keyframes item-in{from{opacity:0;transform:translateX(-18px)}to{opacity:1;transform:translateX(0)}}@keyframes edited{0%{background:#fff3c4;transform:translateX(-5px)}100%{background:transparent;transform:translateX(0)}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:1ms!important;transition-duration:1ms!important}}@media(max-width:620px){header{padding:0 14px}#stage{padding:20px 10px 72px}main{aspect-ratio:4/3}.slide{grid-template-columns:1fr;gap:8px;padding:30px}.slide-number{border:0;padding:0}}
-:root{color:#202124;background:#f1f3f4;font-family:Arial,Helvetica,sans-serif}*{box-sizing:border-box}body{min-height:100vh;margin:0;background:#f1f3f4}header{height:54px;padding:0 22px;display:flex;align-items:center;justify-content:space-between;background:#fff;border-bottom:1px solid #dadce0}h1,h2,p{margin:0}h1{color:#5f6368;font-size:.78rem;letter-spacing:.08em}#status{color:#188038;font:700 .7rem "Courier New",monospace}#stage{min-height:calc(100vh - 54px);padding:clamp(18px,4vh,46px) clamp(14px,6vw,96px) 76px;display:grid;place-items:center}main{width:min(100%,1240px);aspect-ratio:16/9;position:relative;background:#fff;box-shadow:0 3px 15px #2021242b;overflow:hidden}.slide{position:absolute;inset:0;padding:clamp(30px,6vw,104px);display:grid;grid-template-columns:74px 1fr;gap:clamp(20px,3vw,46px);align-content:center;opacity:0;pointer-events:none;transform:translateX(5%);transition:opacity 260ms ease,transform 360ms cubic-bezier(.2,.8,.2,1)}.slide.is-active{opacity:1;pointer-events:auto;transform:translateX(0)}.slide.is-new.is-active{animation:slide-in 480ms cubic-bezier(.16,1,.3,1)}.slide-number{color:#5f6368;font:700 clamp(.65rem,1.1vw,.9rem) "Courier New",monospace;letter-spacing:.08em;border-right:1px solid #dadce0;padding-top:.5em}.slide-content{min-width:0}h2{max-width:18ch;font-size:clamp(2rem,6.2vw,6.5rem);line-height:.94;letter-spacing:-.065em;font-weight:700}ul{margin:clamp(24px,5vh,62px) 0 0;padding:0;list-style:none;display:grid;gap:clamp(11px,1.7vh,21px);max-width:60ch}li{color:#3c4043;font-size:clamp(1rem,2vw,1.7rem);line-height:1.2;display:grid;grid-template-columns:18px 1fr;gap:12px}li::before{content:"•";color:#4285f4;font-size:1.35em;line-height:.75}.title-slide{grid-template-columns:1fr}.title-slide .slide-number,.title-slide ul{display:none}.title-slide h2{max-width:14ch;font-size:clamp(3.1rem,9vw,9.5rem)}.title-slide h2::after{content:"LIVE PRESENTATION";display:block;margin-top:1.5rem;color:#4285f4;font-size:.12em;letter-spacing:.12em}li.is-new{animation:item-in 360ms cubic-bezier(.16,1,.3,1) both}.is-edited{animation:edited 700ms ease-out}.empty{width:100%;height:100%;display:grid;place-items:center;color:#5f6368;font-size:clamp(1.2rem,3vw,2.2rem)}#controls{position:fixed;z-index:2;bottom:18px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px;border:1px solid #dadce0;border-radius:24px;background:#fff;box-shadow:0 2px 8px #20212420}button{width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:#3c4043;cursor:pointer;font-size:1.4rem}button:hover:not(:disabled){background:#f1f3f4}button:disabled{color:#bdc1c6;cursor:default}#position{min-width:54px;color:#5f6368;font: .75rem "Courier New",monospace;text-align:center}@keyframes slide-in{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}@keyframes item-in{from{opacity:0;transform:translateX(-18px)}to{opacity:1;transform:translateX(0)}}@keyframes edited{0%{background:#fff3c4;transform:translateX(-5px)}100%{background:transparent;transform:translateX(0)}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:1ms!important;transition-duration:1ms!important}}@media(max-width:620px){header{padding:0 14px}#stage{padding:20px 10px 72px}main{aspect-ratio:4/3}.slide{grid-template-columns:1fr;gap:8px;padding:30px}.slide-number{border:0;padding:0}.image-left .slide-image,.image-right .slide-image{inset:0;width:100%;height:100%;opacity:.14}.image-left .slide-content{margin-left:0}.image-right .slide-content{max-width:none}}
-.image-left .slide-image,.image-right .slide-image{width:30%;height:70%;top:15%}.image-left .slide-image{left:4%}.image-right .slide-image{right:4%}.image-left .slide-content{margin-left:30%;max-width:70%}.image-right .slide-content{max-width:52%}.image-right .slide-content ul,.image-left .slide-content ul{max-width:100%}.slide-number,.title-slide .slide-number{display:block;position:absolute;z-index:3;right:24px;bottom:20px;border:0;padding:0;color:#5f6368;font-size:.7rem}
-.slide-number,.title-slide .slide-number{right:22px;bottom:18px;z-index:4}.image-credit{left:22px;right:auto;bottom:18px;z-index:4;max-width:calc(100% - 150px)}.template-left,.template-right{grid-template-rows:1fr;align-items:center}.template-left{grid-template-columns:74px minmax(210px,.75fr) minmax(0,1fr);grid-template-areas:"number visual content"}.template-right{grid-template-columns:74px minmax(0,1fr) minmax(210px,.75fr);grid-template-areas:"number content visual"}.template-left .slide-number,.template-right .slide-number{grid-area:number}.template-left .slide-content,.template-right .slide-content{grid-area:content;margin:0;max-width:none}.template-left .slide-image,.template-right .slide-image{position:relative;inset:auto;width:100%;height:min(62vh,520px);grid-area:visual;object-fit:cover}.template-background .slide-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.24}.template-background .slide-content{position:relative;z-index:1}.template-title{grid-template-columns:1fr;align-content:center;background:linear-gradient(135deg,#fff 0%,#f8fbff 100%)}.template-title .slide-content{max-width:78%;margin-left:7%}.template-title .slide-number{display:block}@media(max-width:620px){.template-left,.template-right{display:grid;grid-template-columns:1fr;grid-template-areas:"content"}.template-left .slide-image,.template-right .slide-image{position:absolute;inset:0;width:100%;height:100%;opacity:.14}.image-credit{left:14px;bottom:12px;max-width:calc(100% - 110px)}}
-</style></head><body>
-<header><h1>Slidex</h1><p id="status">CONNECTING</p></header><div id="stage"><main id="slides"><div class="empty">Listening for a topic...</div></main></div><nav id="controls" aria-label="Presentation controls"><button id="previous" aria-label="Previous slide">‹</button><span id="position">— / —</span><button id="next" aria-label="Next slide">›</button></nav>
+/* The frame is the sizing context for everything on a slide, so type and
+   spacing stay proportional to the slide instead of to the browser window. */
+:root{color:#202124;background:#f1f3f4;font-family:Arial,Helvetica,sans-serif}
+*{box-sizing:border-box}
+body{min-height:100vh;margin:0;background:#f1f3f4}
+header{height:54px;padding:0 22px;display:flex;align-items:center;justify-content:space-between;background:#fff;border-bottom:1px solid #dadce0}
+h1,h2,p{margin:0}
+h1{color:#5f6368;font-size:.78rem;letter-spacing:.08em}
+#status{color:#188038;font:700 .7rem "Courier New",monospace}
+#stage{min-height:calc(100vh - 54px);padding:clamp(18px,4vh,46px) clamp(14px,6vw,96px) 76px;display:grid;place-items:center}
+main{container-type:size;container-name:frame;width:min(100%,1240px);aspect-ratio:16/9;position:relative;background:#fff;box-shadow:0 3px 15px #2021242b;overflow:hidden}
+.empty{width:100%;height:100%;display:grid;place-items:center;color:#5f6368;font-size:clamp(1.2rem,3cqw,2.2rem)}
+
+/* Slides stack inside the frame; only the active one is visible. */
+.slide{position:absolute;inset:0;padding:clamp(18px,4.6cqw,74px);display:grid;grid-template-columns:minmax(0,1fr);align-content:center;gap:clamp(14px,2.6cqw,40px);opacity:0;pointer-events:none;transform:translateX(5%);transition:opacity 260ms ease,transform 360ms cubic-bezier(.2,.8,.2,1)}
+.slide.is-active{opacity:1;pointer-events:auto;transform:translateX(0)}
+.slide.is-new.is-active{animation:slide-in 480ms cubic-bezier(.16,1,.3,1)}
+
+/* fitContent() shrinks this block about its left edge when the text is too tall. */
+.slide-content{position:relative;z-index:1;min-width:0;transform-origin:left center}
+h2{max-width:20ch;font-size:clamp(1.5rem,4.6cqw,3.6rem);line-height:.96;letter-spacing:-.045em;font-weight:700;text-wrap:balance}
+ul{margin:clamp(14px,3.2cqh,40px) 0 0;padding:0;list-style:none;display:grid;gap:clamp(7px,1.5cqh,16px);max-width:min(100%,68ch)}
+li{color:#3c4043;font-size:clamp(.85rem,1.9cqw,1.45rem);line-height:1.25;display:grid;grid-template-columns:clamp(12px,1.5cqw,20px) 1fr;gap:clamp(6px,.8cqw,12px)}
+li::before{content:"\2022";color:#4285f4;font-size:1.3em;line-height:.8}
+li.is-new{animation:item-in 360ms cubic-bezier(.16,1,.3,1) both}
+.is-edited{animation:edited 700ms ease-out}
+
+/* Corner labels float above everything, including a background image. */
+.slide-number,.image-credit{position:absolute;bottom:clamp(9px,2.3cqh,20px);z-index:4;color:#5f6368;font-size:clamp(.5rem,.95cqw,.72rem);line-height:1.1}
+.slide-number{right:clamp(10px,1.8cqw,26px);font-family:"Courier New",monospace;font-weight:700;letter-spacing:.08em}
+.image-credit{left:clamp(10px,1.8cqw,26px);max-width:52%;padding:.35em .6em;background:#ffffffe6;color:#3c4043;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.title-slide{background:linear-gradient(135deg,#fff 0%,#f8fbff 100%)}
+.title-slide ul{display:none}
+.title-slide h2{max-width:18ch;font-size:clamp(2rem,7cqw,5.5rem)}
+.title-slide h2::after{content:"LIVE PRESENTATION";display:block;margin-top:1.4em;color:#4285f4;font-size:.11em;letter-spacing:.12em}
+
+/* Images take a real grid column beside the text, or wash out behind it. */
+.slide-image{display:none;z-index:0}
+.has-image .slide-image{display:block}
+.has-image h2{font-size:clamp(1.3rem,3.6cqw,2.9rem)}
+.has-image li{font-size:clamp(.8rem,1.6cqw,1.2rem)}
+.image-left,.image-right{align-items:center;gap:clamp(14px,3.4cqw,52px)}
+.image-left{grid-template-columns:minmax(0,.72fr) minmax(0,1fr);grid-template-areas:"visual content"}
+.image-right{grid-template-columns:minmax(0,1fr) minmax(0,.72fr);grid-template-areas:"content visual"}
+.image-left .slide-content,.image-right .slide-content{grid-area:content}
+.image-left .slide-image,.image-right .slide-image{grid-area:visual;width:100%;height:74cqh;object-fit:cover}
+.image-background .slide-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.24}
+.image-background::after{content:"";position:absolute;inset:0;background:#fff9;pointer-events:none}
+
+#controls{position:fixed;z-index:2;bottom:18px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px;border:1px solid #dadce0;border-radius:24px;background:#fff;box-shadow:0 2px 8px #20212420}
+button{width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:#3c4043;cursor:pointer;font-size:1.4rem}
+button:hover:not(:disabled){background:#f1f3f4}
+button:disabled{color:#bdc1c6;cursor:default}
+#position{min-width:54px;color:#5f6368;font:.75rem "Courier New",monospace;text-align:center}
+
+@keyframes slide-in{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
+@keyframes item-in{from{opacity:0;transform:translateX(-18px)}to{opacity:1;transform:translateX(0)}}
+@keyframes edited{0%{background:#fff3c4}100%{background:transparent}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:1ms!important;transition-duration:1ms!important}}
+
+/* Narrow frames cannot hold a side-by-side image, so it goes behind the text. */
+@container frame (max-width:640px){
+  .slide,.image-left,.image-right{grid-template-columns:minmax(0,1fr);grid-template-areas:"content"}
+  .image-left .slide-image,.image-right .slide-image{grid-area:auto;position:absolute;inset:0;width:100%;height:100%;opacity:.14}
+  .has-image h2{font-size:clamp(1.5rem,4.6cqw,3.6rem)}
+  .has-image li{font-size:clamp(.85rem,1.9cqw,1.45rem)}
+  .image-credit{max-width:64%}
+}
+@media(max-width:620px){
+  header{padding:0 14px}
+  #stage{padding:20px 10px 72px}
+  main{aspect-ratio:4/3}
+}
+</style>
+</head>
+<body>
+<header><h1>Slidex</h1><p id="status">CONNECTING</p></header>
+<div id="stage"><main id="slides"><div class="empty">Listening for a topic...</div></main></div>
+<nav id="controls" aria-label="Presentation controls">
+  <button id="previous" aria-label="Previous slide">‹</button>
+  <span id="position">— / —</span>
+  <button id="next" aria-label="Next slide">›</button>
+</nav>
 <script>
-const slides=document.getElementById("slides"),status=document.getElementById("status"),previousButton=document.getElementById("previous"),nextButton=document.getElementById("next"),position=document.getElementById("position");let previous="",activeIndex=0;const shown=new Set();
-function element(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=text;return node}function animateEdit(node){node.classList.remove("is-edited");void node.offsetWidth;node.classList.add("is-edited")}function paintImage(card,image){const existing=card.querySelector(".slide-image");card.classList.remove("has-image","image-background","image-left","image-right");if(!image){existing?.remove();return}const node=existing??card.appendChild(element("img","slide-image"));if(node.getAttribute("src")!==image.url)node.src=image.url;node.alt=image.alt;node.title=`Image source: ${image.source}`;card.classList.add("has-image",`image-${image.placement}`)}function select(index){const cards=[...slides.querySelectorAll(".slide")];activeIndex=Math.max(0,Math.min(index,cards.length-1));cards.forEach((card,i)=>card.classList.toggle("is-active",i===activeIndex));position.textContent=cards.length?`${activeIndex+1} / ${cards.length}`:"— / —";previousButton.disabled=activeIndex===0;nextButton.disabled=!cards.length||activeIndex===cards.length-1}
-function element(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=text;return node}function animateEdit(node){node.classList.remove("is-edited");void node.offsetWidth;node.classList.add("is-edited")}function paintImage(card,image){const existing=card.querySelector(".slide-image");card.classList.remove("has-image","image-background","image-left","image-right");if(!image){existing?.remove();card.querySelector(".image-credit")?.remove();return}const node=existing??card.appendChild(element("img","slide-image"));if(node.getAttribute("src")!==image.url)node.src=image.url;node.alt=image.alt;node.title=`Image source: ${image.source}`;let credit=card.querySelector(".image-credit");if(!credit){credit=element("a","image-credit");credit.target="_blank";credit.rel="noreferrer";card.appendChild(credit)}credit.href=image.source;credit.textContent=`Image: ${image.alt} · Wikimedia Commons`;card.classList.add("has-image",`image-${image.placement}`)}function select(index){const cards=[...slides.querySelectorAll(".slide")];activeIndex=Math.max(0,Math.min(index,cards.length-1));cards.forEach((card,i)=>card.classList.toggle("is-active",i===activeIndex));position.textContent=cards.length?`${activeIndex+1} / ${cards.length}`:"— / —";previousButton.disabled=activeIndex===0;nextButton.disabled=!cards.length||activeIndex===cards.length-1}
-function paintImage(card,image){const existing=card.querySelector(".slide-image");card.classList.toggle("template-title",card.classList.contains("title-slide"));card.classList.remove("has-image","image-background","image-left","image-right","template-left","template-right","template-background");if(!image){existing?.remove();card.querySelector(".image-credit")?.remove();return}const node=existing??card.appendChild(element("img","slide-image"));if(node.getAttribute("src")!==image.url)node.src=image.url;node.alt=image.alt;node.title=`Image source: ${image.source}`;let credit=card.querySelector(".image-credit");if(!credit){credit=element("a","image-credit");credit.target="_blank";credit.rel="noreferrer";card.appendChild(credit)}credit.href=image.source;credit.textContent=`Image: ${image.alt} · Wikimedia Commons`;card.classList.add("has-image",`image-${image.placement}`,`template-${image.placement}`)}
-function render(deck){const fingerprint=JSON.stringify(deck.slides);if(fingerprint===previous)return;previous=fingerprint;if(!deck.slides.length){if(!slides.querySelector(".empty"))slides.replaceChildren(element("div","empty","Listening for a topic..."));select(0);return}slides.querySelector(".empty")?.remove();const existing=new Map([...slides.querySelectorAll(".slide")].map(card=>[card.dataset.slide,card]));
-// A slide id the page has never drawn is one the speaker just created; its
-// position can be anywhere, because the title slide is inserted at the front.
-let created=-1;deck.slides.forEach((slide,index)=>{const key=String(slide.id);let card=existing.get(key);if(!card){card=element("article","slide is-new");card.dataset.slide=key;card.append(element("div","slide-number"));const content=element("div","slide-content");content.append(element("h2"));content.append(element("ul"));card.append(content)}if(!shown.has(key)){shown.add(key);created=index}card.classList.toggle("title-slide",slide.kind==="title");card.querySelector(".slide-number").textContent=`SLIDE ${String(slide.number).padStart(2,"0")}`;const title=card.querySelector("h2");if(title.textContent&&title.textContent!==slide.title)animateEdit(title);title.textContent=slide.title;const list=card.querySelector("ul"),oldItems=[...list.children];slide.bullets.forEach((bullet,rank)=>{let item=oldItems[rank];if(!item){item=element("li","is-new",bullet);list.append(item)}else if(item.textContent!==bullet){item.textContent=bullet;animateEdit(item)}});oldItems.slice(slide.bullets.length).forEach(item=>item.remove());paintImage(card,slide.image);slides.append(card);existing.delete(key)});existing.forEach(card=>card.remove());select(created===-1?activeIndex:created)}
-previousButton.addEventListener("click",()=>select(activeIndex-1));nextButton.addEventListener("click",()=>select(activeIndex+1));document.addEventListener("keydown",event=>{if(["ArrowLeft","ArrowUp"].includes(event.key))select(activeIndex-1);if(["ArrowRight","ArrowDown"," "].includes(event.key)){event.preventDefault();select(activeIndex+1)}});async function refresh(){try{const response=await fetch("/api/slides",{cache:"no-store"});if(!response.ok)throw new Error(`HTTP ${response.status}`);render(await response.json());status.textContent="LIVE / LISTENING"}catch(error){status.textContent="RECONNECTING"}}refresh();setInterval(refresh,500);
-</script></body></html>
+const slides = document.getElementById("slides");
+const statusLabel = document.getElementById("status");
+const previousButton = document.getElementById("previous");
+const nextButton = document.getElementById("next");
+const counter = document.getElementById("position");
+
+let previous = ""; // fingerprint of the deck as last drawn
+let activeIndex = 0;
+const shown = new Set(); // slide ids this page has drawn at least once
+
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function animateEdit(node) {
+  node.classList.remove("is-edited");
+  void node.offsetWidth; // restart the animation
+  node.classList.add("is-edited");
+}
+
+function select(index) {
+  const cards = [...slides.querySelectorAll(".slide")];
+  activeIndex = Math.max(0, Math.min(index, cards.length - 1));
+  cards.forEach((card, i) => card.classList.toggle("is-active", i === activeIndex));
+  counter.textContent = cards.length ? `${activeIndex + 1} / ${cards.length}` : "— / —";
+  previousButton.disabled = activeIndex === 0;
+  nextButton.disabled = !cards.length || activeIndex === cards.length - 1;
+}
+
+// Commons occasionally serves a URL that will not load. Remember those and let
+// the slide fall back to full-width text rather than holding an empty column.
+const brokenImages = new Set();
+
+function paintImage(card, image) {
+  if (image && brokenImages.has(image.url)) image = null;
+  card.classList.remove("has-image", "image-background", "image-left", "image-right");
+  const picture = card.querySelector(".slide-image");
+  const credit = card.querySelector(".image-credit");
+  if (!image) {
+    picture?.remove();
+    credit?.remove();
+    return;
+  }
+  const node = picture ?? card.appendChild(element("img", "slide-image"));
+  node.onerror = () => {
+    brokenImages.add(image.url);
+    paintImage(card, null);
+    fitContent(card);
+  };
+  if (node.getAttribute("src") !== image.url) node.src = image.url;
+  node.alt = image.alt;
+  node.title = `Image source: ${image.source}`;
+  const link = credit ?? card.appendChild(Object.assign(element("a", "image-credit"), { target: "_blank", rel: "noreferrer" }));
+  link.href = image.source;
+  link.textContent = `Image: ${image.alt} · Wikimedia Commons`;
+  card.classList.add("has-image", `image-${image.placement}`);
+}
+
+function paintBullets(list, bullets) {
+  const items = [...list.children];
+  bullets.forEach((bullet, rank) => {
+    const item = items[rank];
+    if (!item) {
+      list.append(element("li", "is-new", bullet));
+    } else if (item.textContent !== bullet) {
+      item.textContent = bullet;
+      animateEdit(item);
+    }
+  });
+  items.slice(bullets.length).forEach(item => item.remove());
+}
+
+// Live speech produces titles and bullets of unpredictable length, so the type
+// scale alone cannot guarantee a fit. Measure what was actually laid out and
+// shrink the text block about its left edge until it clears the padding box.
+const MIN_FIT = 0.45;
+function fitContent(card) {
+  const content = card.querySelector(".slide-content");
+  if (!content || !card.clientHeight) return;
+  content.style.transform = "";
+  const style = getComputedStyle(card);
+  const available = card.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  const natural = content.scrollHeight;
+  if (natural > available) {
+    content.style.transform = `scale(${Math.max(MIN_FIT, available / natural).toFixed(4)})`;
+  }
+}
+
+function fitAll() {
+  slides.querySelectorAll(".slide").forEach(fitContent);
+}
+
+function newCard(key) {
+  const card = element("article", "slide is-new");
+  card.dataset.slide = key;
+  card.append(element("div", "slide-number"));
+  const content = element("div", "slide-content");
+  content.append(element("h2"), element("ul"));
+  card.append(content);
+  return card;
+}
+
+function render(deck) {
+  const fingerprint = JSON.stringify(deck.slides);
+  if (fingerprint === previous) return;
+  previous = fingerprint;
+
+  if (!deck.slides.length) {
+    if (!slides.querySelector(".empty")) slides.replaceChildren(element("div", "empty", "Listening for a topic..."));
+    select(0);
+    return;
+  }
+  slides.querySelector(".empty")?.remove();
+
+  const existing = new Map([...slides.querySelectorAll(".slide")].map(card => [card.dataset.slide, card]));
+  // A slide id the page has never drawn is one the speaker just created. Its
+  // position can be anywhere, because the title slide is inserted at the front.
+  let created = -1;
+  deck.slides.forEach((slide, index) => {
+    const key = String(slide.id);
+    const card = existing.get(key) ?? newCard(key);
+    existing.delete(key);
+    if (!shown.has(key)) {
+      shown.add(key);
+      created = index;
+    }
+    card.classList.toggle("title-slide", slide.kind === "title");
+    card.querySelector(".slide-number").textContent = `SLIDE ${String(slide.number).padStart(2, "0")}`;
+    const title = card.querySelector("h2");
+    if (title.textContent && title.textContent !== slide.title) animateEdit(title);
+    title.textContent = slide.title;
+    paintBullets(card.querySelector("ul"), slide.bullets);
+    paintImage(card, slide.image);
+    slides.append(card); // re-appending keeps DOM order in step with deck order
+  });
+  existing.forEach(card => card.remove());
+  fitAll();
+  select(created === -1 ? activeIndex : created);
+}
+
+previousButton.addEventListener("click", () => select(activeIndex - 1));
+nextButton.addEventListener("click", () => select(activeIndex + 1));
+document.addEventListener("keydown", event => {
+  if (["ArrowLeft", "ArrowUp"].includes(event.key)) select(activeIndex - 1);
+  if (["ArrowRight", "ArrowDown", " "].includes(event.key)) {
+    event.preventDefault();
+    select(activeIndex + 1);
+  }
+});
+
+async function refresh() {
+  try {
+    const response = await fetch("/api/slides", { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    render(await response.json());
+    statusLabel.textContent = "LIVE / LISTENING";
+  } catch (error) {
+    statusLabel.textContent = "RECONNECTING";
+  }
+}
+new ResizeObserver(fitAll).observe(slides);
+document.fonts?.ready.then(fitAll);
+refresh();
+setInterval(refresh, 500);
+</script>
+</body>
+</html>

@@ -1,11 +1,11 @@
-"""A minimal, tool-first OpenAI Realtime text client.
+"""Slidex: build a slide deck live from a speaker's microphone.
+
+Audio streams to the OpenAI Realtime API, which edits the in-memory deck by
+calling the local tools in ``TOOL_HANDLERS``. A tiny HTTP server publishes the
+deck to ``index.html``, which polls it and animates the changes.
 
 Set OPENAI_API_KEY, then run:
-    pipenv run python main.py "What time is it in UTC?"
-
-The assistant's text is captured in ``RealtimeToolClient.assistant_text`` but is
-not printed. Replace the example tools in ``TOOL_HANDLERS`` with application
-actions as the app grows.
+    pipenv run python main.py --microphone --web
 """
 
 from __future__ import annotations
@@ -13,12 +13,10 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import logging
 import os
 import threading
 import time
-import uuid
-from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -30,7 +28,6 @@ import websocket
 
 MODEL = "gpt-realtime-2.1"
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
-LOGGER = logging.getLogger(__name__)
 
 
 def trace(message: str) -> None:
@@ -38,16 +35,22 @@ def trace(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-def get_current_time(timezone: str = "UTC") -> dict[str, str]:
-    """Example local tool. Add real application tools beside this function."""
-    if timezone.upper() != "UTC":
-        return {"error": "This example only supports UTC."}
-    return {"timezone": "UTC", "time": datetime.now(UTC).isoformat()}
-
+MAX_BULLETS_PER_SLIDE = 5
+AUDIO_RATE = 24000  # Hz, 16-bit mono PCM
+# A decision normally takes a second or two. These bound what happens when one
+# does not: audio stops piling up, and a wedged turn eventually releases.
+MAX_BUFFERED_AUDIO_SECONDS = 8.0
+MAX_TURN_SECONDS = 20.0
+MAX_TOOL_ROUNDS = 4
+# Slides alternate sides so a run of illustrated slides has some visual rhythm.
+IMAGE_PLACEMENTS = ("right", "left")
+IMAGE_SEARCH_TIMEOUT = 12
 
 SLIDES: list[dict[str, Any]] = []
-IMAGE_RESULTS: dict[str, dict[str, str]] = {}
 DECK_LOCK = threading.RLock()
+# Image lookups are HTTP calls. They must never run on the Realtime event loop:
+# a slow one stalls every response, and the microphone backs up behind it.
+IMAGE_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="image-search")
 _LAST_SLIDE_ID = 0
 
 
@@ -57,10 +60,6 @@ def new_slide(kind: str, title: str) -> dict[str, Any]:
     with DECK_LOCK:
         _LAST_SLIDE_ID += 1
         return {"id": _LAST_SLIDE_ID, "kind": kind, "title": title, "bullets": []}
-
-
-def current_slide() -> dict[str, Any] | None:
-    return SLIDES[-1] if SLIDES else None
 
 
 def current_content_slide() -> dict[str, Any] | None:
@@ -86,7 +85,7 @@ def slide_state() -> dict[str, Any]:
             "slide_count": len(SLIDES),
             "has_title_slide": has_title_slide,
             "current_slide": {
-                "number": len(SLIDES),
+                "number": SLIDES.index(slide) + 1,
                 "title": slide["title"],
                 "bullets": list(slide["bullets"]),
             },
@@ -101,7 +100,7 @@ def deck_snapshot() -> dict[str, Any]:
                 {
                     "id": slide["id"],
                     "number": index,
-                    "kind": slide.get("kind", "content"),
+                    "kind": slide["kind"],
                     "title": slide["title"],
                     "bullets": list(slide["bullets"]),
                     "image": slide.get("image"),
@@ -129,15 +128,21 @@ def create_title_slide(title: str) -> dict[str, Any]:
         return {"status": "created", **slide_state()}
 
 
+def append_content_slide(title: str) -> dict[str, Any]:
+    with DECK_LOCK:
+        slide = new_slide("content", title)
+        SLIDES.append(slide)
+        trace(f"NEW SLIDE #{len(SLIDES)}: {title}")
+        return slide
+
+
 def create_new_slide(title: str) -> dict[str, Any]:
     """Start a new topic in the live deck."""
     with DECK_LOCK:
         cleaned = title.strip()
         if not cleaned:
             return {"status": "ignored", "reason": "A slide title is required.", **slide_state()}
-
-        SLIDES.append(new_slide("content", cleaned))
-        trace(f"NEW SLIDE #{len(SLIDES)}: {cleaned}")
+        append_content_slide(cleaned)
         return {"status": "created", **slide_state()}
 
 
@@ -159,35 +164,23 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
 
         slide = current_content_slide()
         assert slide is not None
-        continued = False
-        if len(slide["bullets"]) >= 5:
-            continued_title = slide["title"]
-            if not continued_title.lower().endswith("(continued)"):
-                continued_title = f"{continued_title} (continued)"
-            SLIDES.append(new_slide("content", continued_title))
-            slide = current_content_slide()
-            assert slide is not None
-            continued = True
-            trace(f"CONTINUED SLIDE #{len(SLIDES)}: {continued_title}")
+        continued = len(slide["bullets"]) >= MAX_BULLETS_PER_SLIDE
+        if continued:
+            title = slide["title"]
+            if not title.lower().endswith("(continued)"):
+                title = f"{title} (continued)"
+            slide = append_content_slide(title)
         slide["bullets"].append(cleaned)
         trace(f"BULLET #{len(slide['bullets'])}: • {cleaned}")
-        image_added = False
-        image_id: str | None = None
-        # The model may still call the image tools itself, but do not leave a
-        # newly created content slide text-only just because it skipped them.
-        if "image" not in slide and not slide.get("image_search_attempted"):
-            slide["image_search_attempted"] = True
-            image_result = search_image(f"{slide['title']} {cleaned}")
-            if image_result.get("status") == "found":
-                image_id = image_result["image_id"]
-                integration = integrate_image(image_id, "right")
-                image_added = integration.get("status") == "integrated"
+        # Illustrate each content slide once, in the background. The tool result
+        # does not wait for it; the browser poll picks the image up when it lands.
+        if not slide.get("image_requested"):
+            slide["image_requested"] = True
+            IMAGE_WORKERS.submit(load_slide_image, slide, f"{slide['title']} {cleaned}")
         return {
             "status": "saved",
             "bullet_number": len(slide["bullets"]),
             "continued": continued,
-            "image_added": image_added,
-            "image_id": image_id,
             **slide_state(),
         }
 
@@ -214,11 +207,11 @@ def update_bullet_point(bullet_number: int, bullet_point: str) -> dict[str, Any]
         return {"status": "updated", "bullet_number": bullet_number, **slide_state()}
 
 
-def search_image(query: str) -> dict[str, Any]:
-    """Find one reusable, topic-relevant image from Wikimedia Commons."""
+def find_image(query: str) -> dict[str, str] | None:
+    """Return one reusable Commons image. Blocking: never call on the event loop."""
     cleaned = query.strip()
     if not cleaned:
-        return {"status": "ignored", "reason": "An image search query is required."}
+        return None
     params = urlencode(
         {
             "action": "query",
@@ -228,7 +221,7 @@ def search_image(query: str) -> dict[str, Any]:
             "gsrnamespace": "6",
             "gsrlimit": "8",
             "prop": "imageinfo",
-            "iiprop": "url|extmetadata",
+            "iiprop": "url|mime",
             "iiurlwidth": "1600",
         }
     )
@@ -237,82 +230,51 @@ def search_image(query: str) -> dict[str, Any]:
         headers={"User-Agent": "Slidex/1.0 (local presentation tool)"},
     )
     try:
-        with urlopen(request, timeout=12) as response:  # noqa: S310 - fixed Wikimedia API endpoint
+        with urlopen(request, timeout=IMAGE_SEARCH_TIMEOUT) as response:  # noqa: S310 - fixed Wikimedia endpoint
             pages = json.load(response).get("query", {}).get("pages", {}).values()
-    except OSError as exc:
-        return {"status": "unavailable", "reason": f"Image search failed: {exc}"}
+    except (OSError, ValueError) as exc:
+        trace(f"IMAGE SEARCH FAILED: {exc}")
+        return None
 
     for page in pages:
         info = next(iter(page.get("imageinfo", [])), {})
         image_url = info.get("thumburl") or info.get("url")
-        if not image_url:
+        # File search also returns audio, video, and PDFs; those have no usable thumbnail.
+        if not image_url or not info.get("mime", "").startswith("image/"):
             continue
-        image_id = f"image_{uuid.uuid4().hex[:12]}"
-        result = {
-            "id": image_id,
+        title = page.get("title", "")
+        trace(f"IMAGE FOUND: {cleaned}")
+        return {
             "url": image_url,
-            "alt": page.get("title", "").removeprefix("File:"),
-            "source": f"https://commons.wikimedia.org/wiki/{page.get('title', '').replace(' ', '_')}",
+            "alt": title.removeprefix("File:"),
+            "source": f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}",
         }
-        with DECK_LOCK:
-            IMAGE_RESULTS[image_id] = result
-        trace(f"IMAGE FOUND {image_id}: {cleaned}")
-        return {"status": "found", "image_id": image_id, "query": cleaned, **result}
-    return {"status": "not_found", "query": cleaned}
+    trace(f"IMAGE NOT FOUND: {cleaned}")
+    return None
 
 
-def integrate_image(image_id: str, placement: str) -> dict[str, Any]:
-    """Place a previously found image on the current content slide."""
+def load_slide_image(slide: dict[str, Any], query: str) -> None:
+    """Background worker: illustrate one slide, or quietly leave it text-only."""
+    image = find_image(query)
+    if image is None:
+        return
     with DECK_LOCK:
-        image = IMAGE_RESULTS.get(image_id)
-        slide = current_content_slide()
-        if image is None:
-            return {"status": "ignored", "reason": "That image ID is unavailable.", **slide_state()}
-        if slide is None:
-            return {"status": "ignored", "reason": "There is no content slide to illustrate.", **slide_state()}
-        if placement not in {"background", "left", "right"}:
-            return {"status": "ignored", "reason": "Placement must be background, left, or right.", **slide_state()}
+        if slide not in SLIDES or "image" in slide:
+            return
+        rank = [item for item in SLIDES if item["kind"] == "content"].index(slide)
+        placement = IMAGE_PLACEMENTS[rank % len(IMAGE_PLACEMENTS)]
         slide["image"] = {**image, "placement": placement}
-        trace(f"IMAGE INTEGRATED {image_id} / {placement}")
-        return {"status": "integrated", "image_id": image_id, "placement": placement, **slide_state()}
+        trace(f"IMAGE PLACED on slide {slide['id']} / {placement}")
 
 
 TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
-    "get_current_time": get_current_time,
     "create_title_slide": create_title_slide,
     "create_new_slide": create_new_slide,
     "new_bullet_point": new_bullet_point,
     "update_bullet_point": update_bullet_point,
-    "search_image": search_image,
-    "integrate_image": integrate_image,
 }
 
 TOOLS = [
-    {
-        "type": "function",
-        "name": "search_image",
-        "description": "Find a real, relevant image for the current slide. Use only when a visual materially improves the slide.",
-        "parameters": {
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "A precise Wikimedia Commons image search query."}},
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "integrate_image",
-        "description": "Place an image returned by search_image on the current content slide.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "image_id": {"type": "string", "description": "The image_id returned by search_image."},
-                "placement": {"type": "string", "enum": ["background", "left", "right"], "description": "How the image should compose with the slide text."},
-            },
-            "required": ["image_id", "placement"],
-            "additionalProperties": False,
-        },
-    },
     {
         "type": "function",
         "name": "create_title_slide",
@@ -329,19 +291,6 @@ TOOLS = [
                 }
             },
             "required": ["title"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "get_current_time",
-        "description": "Get the current UTC time.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "timezone": {"type": "string", "description": "Use UTC."}
-            },
-            "required": [],
             "additionalProperties": False,
         },
     },
@@ -452,7 +401,7 @@ def start_web_server(port: int) -> ThreadingHTTPServer:
 
 
 class RealtimeToolClient:
-    """Runs one text turn and services local function calls synchronously."""
+    """Holds one Realtime session and services its local function calls."""
 
     def __init__(self, api_key: str, model: str = MODEL) -> None:
         self.model = model
@@ -462,9 +411,13 @@ class RealtimeToolClient:
             header=[f"Authorization: Bearer {api_key}"],
             timeout=30,
         )
+        # The handshake should be quick, but a live session can legitimately go
+        # quiet for longer than any fixed read timeout.
+        self.socket.settimeout(None)
         self._send_lock = threading.Lock()
         self.response_idle = threading.Event()
         self.response_idle.set()
+        self.turn_started_at = 0.0
         self.assistant_text = ""
         self.tool_calls: list[dict[str, Any]] = []
         trace("WebSocket connected. Waiting for session events.")
@@ -473,9 +426,9 @@ class RealtimeToolClient:
         # Audio capture and response handling run on different threads.
         with self._send_lock:
             self.socket.send(json.dumps(event))
-        # event_type = event["type"]
-        # if event_type != "input_audio_buffer.append":
-        #     trace(f"Sent client event: {event_type}")
+
+    def request_response(self, tool_choice: str = "auto") -> None:
+        self.send({"type": "response.create", "response": {"tool_choice": tool_choice}})
 
     def configure(self, manual_audio_turns: bool = False) -> None:
         turn_detection: dict[str, Any] | None
@@ -513,8 +466,7 @@ class RealtimeToolClient:
                         "you are not highly confident the statement is from the main speaker and "
                         "can be recorded without adding meaning, make no tool call. Do not "
                         "reinterpret a statement through the lens of the current slide's topic. "
-                        "As soon "
-                        "as the opening topic is clear, first call create_title_slide with "
+                        "As soon as the opening topic is clear, first call create_title_slide with "
                         "a concise presentation title. Then, when there is a substantive "
                         "point, create a separate content slide with create_new_slide "
                         "before adding bullets. Do not make the title slide from a greeting, "
@@ -535,11 +487,7 @@ class RealtimeToolClient:
                         "same topic needs another point after five bullets, start a new "
                         "slide titled with the previous title plus ' (continued)'. Do not "
                         "make a new slide merely because of a pause. "
-                        "Every content slide should have one relevant real image unless an "
-                        "image would be misleading. Prefer calling search_image with a "
-                        "precise query, then call integrate_image with the returned image_id. "
-                        "Use background for atmospheric visuals and left or right when the "
-                        "image should sit beside readable text. Never invent an image_id. "
+                        "Slides are illustrated automatically; there is no image tool to call. "
                         "Prefer tool calls over text responses."
                     ),
                     "tools": TOOLS,
@@ -563,56 +511,55 @@ class RealtimeToolClient:
         )
         # Require a tool on the first pass. After a tool result, ``auto`` lets
         # the model either call another tool or produce its hidden text answer.
-        self.send({"type": "response.create", "response": {"tool_choice": "required"}})
-        # trace("Requested a response; the first pass must choose a tool.")
-        return self._receive_until_complete()
-
-    def _receive_until_complete(self) -> str:
-        while True:
-            event = json.loads(self.socket.recv())
-            event_type = event.get("type")
-            # trace(f"Received server event: {event_type}")
-
-            if event_type == "response.output_text.delta":
-                # Deliberately retain, rather than display, assistant text.
-                self.assistant_text += event.get("delta", "")
-                # trace(f"Received hidden text delta ({len(event.get('delta', ''))} characters).")
-            elif event_type == "response.done":
-                calls = [
-                    item
-                    for item in event["response"].get("output", [])
-                    if item.get("type") == "function_call"
-                ]
-                if not calls:
-                    # trace("Response complete; no tool call requested.")
-                    return self.assistant_text
-                trace(f"Response complete with {len(calls)} local tool call(s).")
-                for call in calls:
-                    self._run_tool(call)
-                self.send({"type": "response.create", "response": {"tool_choice": "auto"}})
-            elif event_type == "error":
-                raise RuntimeError(f"Realtime API error: {event.get('error', event)}")
+        self.request_response("required")
+        while self._finish_response():
+            self.request_response()
+        return self.assistant_text
 
     def begin_manual_audio_turn(self) -> bool:
         """Commit the buffered PCM and ask the model to evaluate that time slice."""
         if not self.response_idle.is_set():
             return False
         self.response_idle.clear()
+        self.turn_started_at = time.monotonic()
         self.send({"type": "input_audio_buffer.commit"})
-        self.send({"type": "response.create", "response": {"tool_choice": "auto"}})
+        self.request_response()
+        return True
+
+    def release_stalled_turn(self) -> bool:
+        """Let audio flow again if a turn never reported back."""
+        if self.response_idle.is_set() or time.monotonic() - self.turn_started_at < MAX_TURN_SECONDS:
+            return False
+        trace(f"No response after {MAX_TURN_SECONDS:g}s; abandoning the turn and resuming audio.")
+        self.response_idle.set()
         return True
 
     def listen_forever(self, manual_audio_turns: bool = False) -> None:
         """Process automatic VAD turns or app-scheduled microphone turns."""
+        rounds = 0
+        while True:
+            if self._finish_response() and rounds < MAX_TOOL_ROUNDS:
+                # VAD (or the audio committer) starts the initial response; the
+                # follow-up must wait until the local tool outputs are present.
+                rounds += 1
+                self.request_response()
+                continue
+            if rounds >= MAX_TOOL_ROUNDS:
+                trace(f"Stopping after {rounds} chained tool rounds; waiting for new audio.")
+            rounds = 0
+            if manual_audio_turns:
+                self.response_idle.set()
+                trace("Audio decision complete; waiting for the next chunk.")
+
+    def _finish_response(self) -> bool:
+        """Block until a response completes; return whether it ran any local tools."""
         while True:
             event = json.loads(self.socket.recv())
             event_type = event.get("type")
-            # trace(f"Received server event: {event_type}")
 
             if event_type == "response.output_text.delta":
-                # Text is intentionally held for the application, not displayed.
+                # Deliberately retain, rather than display, assistant text.
                 self.assistant_text += event.get("delta", "")
-                # trace(f"Received hidden text delta ({len(event.get('delta', ''))} characters).")
             elif event_type == "input_audio_buffer.speech_started":
                 trace("VAD: speech detected; continuing to stream microphone audio.")
             elif event_type == "input_audio_buffer.speech_stopped":
@@ -626,26 +573,24 @@ class RealtimeToolClient:
                 trace(f"Response complete with {len(calls)} local tool call(s).")
                 for call in calls:
                     self._run_tool(call)
-                if calls:
-                    # VAD starts the initial response. We explicitly start the
-                    # follow-up only after the local tool outputs are present.
-                    self.send(
-                        {"type": "response.create", "response": {"tool_choice": "auto"}}
-                    )
-                elif manual_audio_turns:
-                    self.response_idle.set()
-                    trace("Audio decision complete; waiting for the next chunk.")
+                return bool(calls)
             elif event_type == "error":
-                raise RuntimeError(f"Realtime API error: {event.get('error', event)}")
+                # A failed request must not end the talk, and must not leave the
+                # audio committer waiting on a response.done that never comes.
+                trace(f"Realtime API error: {event.get('error', event)}")
+                return False
 
     def _run_tool(self, call: dict[str, Any]) -> None:
         name = call.get("name", "")
         arguments: dict[str, Any] = {}
+        handler = TOOL_HANDLERS.get(name)
         try:
-            arguments = json.loads(call.get("arguments", "{}"))
+            arguments = json.loads(call.get("arguments") or "{}")
             trace(f"Running local tool {name!r} with arguments: {arguments}")
-            result: dict[str, Any] = TOOL_HANDLERS[name](**arguments)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            if handler is None:
+                raise LookupError("no such tool")
+            result: dict[str, Any] = handler(**arguments)
+        except Exception as exc:  # noqa: BLE001 - report the failure to the model, keep the session alive
             result = {"error": f"{name or 'unknown tool'} failed: {exc}"}
         trace(f"Tool {name!r} finished with result: {result}")
 
@@ -678,46 +623,47 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
             "On Ubuntu/Debian run: sudo apt-get install libportaudio2"
         ) from exc
 
-    audio_chunks = 0
-    audio_bytes = 0
-    last_reported_at = time.monotonic()
-    audio_pending = threading.Event()
     stop_commits = threading.Event()
+    buffered_bytes = 0
+    dropping = False
+    buffer_lock = threading.Lock()
+    max_buffered_bytes = int(MAX_BUFFERED_AUDIO_SECONDS * AUDIO_RATE * 2)
 
     def on_audio(indata: Any, frames: int, time_info: Any, status: Any) -> None:
-        nonlocal audio_chunks, audio_bytes, last_reported_at
+        nonlocal buffered_bytes, dropping
         if status:
-            LOGGER.warning("Microphone status: %s", status)
             trace(f"Microphone status: {status}")
         raw_audio = bytes(indata)
+        with buffer_lock:
+            # Once a decision is slow, buffering everything said meanwhile only
+            # produces one huge catch-up turn. Cap it and drop the excess.
+            if buffered_bytes + len(raw_audio) > max_buffered_bytes:
+                if not dropping:
+                    dropping = True
+                    trace(f"Buffer full at {MAX_BUFFERED_AUDIO_SECONDS:g}s; dropping audio until the deck catches up.")
+                return
+            buffered_bytes += len(raw_audio)
         client.send(
             {
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(raw_audio).decode("ascii"),
             }
         )
-        audio_pending.set()
-        audio_chunks += 1
-        audio_bytes += len(raw_audio)
-        now = time.monotonic()
-        # if now - last_reported_at >= 1:
-        #     trace(
-        #         "Microphone streaming: "
-        #         f"{audio_chunks} chunks, {audio_bytes} PCM bytes sent in the last second."
-        #     )
-        #     audio_chunks = 0
-        #     audio_bytes = 0
-        #     last_reported_at = now
 
     def commit_audio_chunks() -> None:
+        nonlocal buffered_bytes, dropping
         while not stop_commits.wait(chunk_seconds):
-            if not audio_pending.is_set():
+            client.release_stalled_turn()
+            with buffer_lock:
+                pending = buffered_bytes
+            if not pending:
                 continue
             if not client.response_idle.is_set():
-                trace("Keeping audio buffered while the previous tool decision finishes.")
                 continue
-            audio_pending.clear()
-            trace(f"Committing up to {chunk_seconds:g} seconds of audio for a deck decision.")
+            with buffer_lock:
+                buffered_bytes = 0
+                dropping = False
+            trace(f"Committing {pending / (AUDIO_RATE * 2):.1f}s of audio for a deck decision.")
             client.begin_manual_audio_turn()
 
     client.configure(manual_audio_turns=True)
@@ -741,7 +687,7 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a tool-first Realtime text turn.")
+    parser = argparse.ArgumentParser(description="Build a slide deck live from speech.")
     parser.add_argument("prompt", nargs="?", help="Optional text supplied to the Realtime session.")
     parser.add_argument(
         "--microphone",
@@ -784,18 +730,16 @@ def main() -> None:
             stream_microphone(client, args.chunk_seconds)
         else:
             client.ask(args.prompt)
-        LOGGER.info("Completed %d tool call(s).", len(client.tool_calls))
         trace(f"Completed {len(client.tool_calls)} tool call(s).")
     except KeyboardInterrupt:
-        LOGGER.info("Stopped after %d tool call(s).", len(client.tool_calls))
         trace(f"Stopped after {len(client.tool_calls)} tool call(s).")
     finally:
         client.close()
+        IMAGE_WORKERS.shutdown(wait=False, cancel_futures=True)
         if web_server is not None:
             web_server.shutdown()
             web_server.server_close()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     main()
