@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LIVE DECK</title>
+  <style>
+    :root { color: #000; background: #fff; font-family: Arial, Helvetica, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: #fff; }
+    header { display: flex; justify-content: space-between; gap: 24px; align-items: baseline; border: 5px solid #000; padding: 18px 20px; }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: clamp(2.1rem, 7vw, 6rem); letter-spacing: -0.09em; line-height: .8; font-weight: 900; }
+    #status { font-family: "Courier New", monospace; font-size: .8rem; font-weight: 700; text-align: right; }
+    main { display: grid; gap: 24px; margin-top: 24px; }
+    .slide { min-height: 360px; border: 5px solid #000; padding: 28px; display: grid; grid-template-columns: 84px 1fr; gap: 24px; background: #fff; }
+    .slide-number { font-family: "Courier New", monospace; font-size: 1rem; font-weight: 900; border-right: 5px solid #000; padding-right: 18px; }
+    .slide-content { min-width: 0; }
+    h2 { max-width: 18ch; font-size: clamp(2rem, 5vw, 5.5rem); line-height: .9; letter-spacing: -0.075em; font-weight: 900; text-transform: uppercase; }
+    ul { margin: 44px 0 0; padding: 0; list-style: none; display: grid; gap: 13px; max-width: 70ch; }
+    li { font-size: clamp(1rem, 2vw, 1.45rem); font-weight: 700; line-height: 1.15; display: grid; grid-template-columns: 22px 1fr; gap: 10px; }
+    li::before { content: "■"; font-size: .75em; padding-top: .18em; }
+    .empty { border: 5px dashed #000; padding: 48px 28px; font-size: clamp(1.4rem, 4vw, 3rem); font-weight: 900; text-transform: uppercase; }
+    @media (max-width: 620px) {
+      body { padding: 12px; }
+      header, .slide { border-width: 4px; }
+      header { display: block; }
+      #status { margin-top: 14px; text-align: left; }
+      .slide { grid-template-columns: 1fr; gap: 18px; padding: 20px; }
+      .slide-number { border-right: 0; border-bottom: 4px solid #000; padding: 0 0 12px; }
+      ul { margin-top: 30px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>LIVE<br>DECK</h1>
+    <p id="status">CONNECTING</p>
+  </header>
+  <main id="slides"><div class="empty">Listening for a topic...</div></main>
+  <script>
+    const slides = document.getElementById("slides");
+    const status = document.getElementById("status");
+    let previous = "";
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function render(deck) {
+      const fingerprint = JSON.stringify(deck.slides);
+      if (fingerprint === previous) return;
+      previous = fingerprint;
+      slides.replaceChildren();
+      if (!deck.slides.length) {
+        slides.append(element("div", "empty", "Listening for a topic..."));
+        return;
+      }
+      for (const slide of deck.slides) {
+        const card = element("article", "slide");
+        card.append(element("div", "slide-number", `SLIDE ${String(slide.number).padStart(2, "0")}`));
+        const content = element("div", "slide-content");
+        content.append(element("h2", "", slide.title));
+        const list = element("ul");
+        for (const bullet of slide.bullets) list.append(element("li", "", bullet));
+        content.append(list);
+        card.append(content);
+        slides.append(card);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/slides", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+        status.textContent = "LIVE / LISTENING";
+      } catch (error) {
+        status.textContent = "RECONNECTING";
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 500);
+  </script>
+</body>
+</html>
