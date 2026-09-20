@@ -298,19 +298,26 @@ function render(deck) {
   });
   fitAll();
   // Where the deck puts the viewer, in order of authority:
-  //   1. a slide that has just appeared. Seeing it for the first time is the
-  //      evidence something was created, so this works for every path that
-  //      makes a slide -- including one that forgets to move active_slide_id.
-  //   2. active_slide_id, when the backend has moved it since we last followed.
+  //   1. active_slide_id, whenever a slide has just appeared or the backend has
+  //      moved the pointer since we last followed it. The slide being written is
+  //      the one to watch, and it is not always the newest: a title slide that
+  //      arrives after the first content slide is inserted at the front while
+  //      the bullets keep landing on the content slide. Jumping to the title
+  //      there parked the viewer on it and made stepping forward to the live
+  //      slide look like browsing away, which paused the recorder.
+  //   2. a slide that has just appeared, when the deck names no destination
+  //      (an older publisher). Seeing it for the first time is the evidence
+  //      something was created.
   //   3. otherwise nobody created anything, so leave a manual selection alone,
   //      holding the slide by id because an insert at the front shifts indices.
   const destination = deck.slides.findIndex(slide => String(slide.id) === String(deck.active_slide_id));
-  if (createdIndex !== -1) {
-    followedSlideId = deck.active_slide_id; // stay in step so rule 2 cannot bounce us
-    select(createdIndex);
-  } else if (destination !== -1 && String(deck.active_slide_id) !== String(followedSlideId)) {
+  const pointerMoved = String(deck.active_slide_id) !== String(followedSlideId);
+  if (destination !== -1 && (createdIndex !== -1 || pointerMoved)) {
     followedSlideId = deck.active_slide_id;
     select(destination);
+  } else if (createdIndex !== -1) {
+    followedSlideId = deck.active_slide_id; // stay in step so rule 1 cannot bounce us
+    select(createdIndex);
   } else {
     const held = deck.slides.findIndex(slide => String(slide.id) === heldId);
     select(held === -1 ? activeIndex : held);

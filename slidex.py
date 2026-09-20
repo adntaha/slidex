@@ -18,6 +18,7 @@ import contextlib
 import json
 import os
 import platform
+import random
 import socket
 import sys
 import threading
@@ -60,6 +61,14 @@ SILENCE_PEAK = 900  # int16 amplitude below which a block counts as silence
 SILENCE_HOLD_SECONDS = 0.35  # a pause this long ends an utterance
 MIN_UTTERANCE_SECONDS = 1.0  # never commit a sliver just because it opened quietly
 MIN_WORDS_TO_EDIT = 4  # below this the transcript is not worth a deck decision
+# Stating a subject takes a sentence. The first tick fires at four words, and
+# four words into a talk is a greeting or a run-up, never the subject -- yet
+# that was exactly what became the deck title.
+MIN_WORDS_FOR_TITLE = 12
+# The title may be revised while the subject is still emerging, and is frozen
+# once this many content slides exist: by then the subject is settled, and a
+# title that keeps changing reads as indecision to the audience.
+TITLE_SETTLES_AFTER_SLIDES = 3
 MIN_SPEECH_SECONDS = 0.3  # a window holding less speech than this is not a decision
 PRE_ROLL_BLOCKS = 3  # ~300 ms of lead-in kept back so a word onset is not clipped
 
@@ -79,6 +88,12 @@ MAX_TOOL_ROUNDS = 4
 # Slides alternate sides so a run of illustrated slides has some visual rhythm.
 IMAGE_PLACEMENTS = ("right", "left")
 IMAGE_SEARCH_TIMEOUT = 12
+# How many search results a slide may choose from. Slide N takes result N so a
+# run of similar queries (continuation slides, a title slide next to its first
+# content slide) is illustrated with different pictures rather than the same top
+# hit repeated; a search with fewer results than that falls back to a random
+# pick from this many.
+IMAGE_CANDIDATES = 10
 IMAGE_QUERY_MODEL = "gpt-4.1-mini"  # a naming task, and it runs off the critical path
 IMAGE_QUERY_TIMEOUT = 12
 
@@ -137,7 +152,6 @@ DECK_LOCK = threading.RLock()
 # The display receives this with every snapshot so its status matches the audio gate.
 DECK_PAUSED = threading.Event()
 DECK_VERSION = 0
-ACTIVE_SLIDE_ID: int | None = None
 # Image lookups are HTTP calls. They must never run on the Realtime event loop:
 # a slow one stalls every response, and the microphone backs up behind it.
 IMAGE_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="image-search")
@@ -151,17 +165,10 @@ def mark_deck_changed() -> None:
 
 
 def new_slide(kind: str, title: str) -> dict[str, Any]:
-    """Build a slide with an id that survives the renumbering an insert causes.
-
-    Whatever slide the deck has just gained is the one to show: the speaker is
-    already talking to it. The follow happens here, at the single point a slide
-    is born, rather than at each call site that creates one -- a call site that
-    forgets leaves the new slide drawn somewhere off-screen.
-    """
-    global _LAST_SLIDE_ID, ACTIVE_SLIDE_ID
+    """Build a slide with an id that survives the renumbering an insert causes."""
+    global _LAST_SLIDE_ID
     with DECK_LOCK:
         _LAST_SLIDE_ID += 1
-        ACTIVE_SLIDE_ID = _LAST_SLIDE_ID
         mark_deck_changed()
         return {"id": _LAST_SLIDE_ID, "kind": kind, "title": title, "bullets": []}
 
@@ -172,6 +179,24 @@ def current_content_slide() -> dict[str, Any] | None:
         if slide.get("kind") != "title":
             return slide
     return None
+
+
+def active_slide_id() -> int | None:
+    """The slide the recorder is writing to, which is the one the display follows.
+
+    Derived rather than tracked. Every edit lands on current_content_slide(), so
+    that is the live slide whenever one exists; only an otherwise empty deck is
+    showing its title slide. A tracked pointer fell out of step here: the title
+    slide is created after the first content slide often enough, and the pointer
+    followed it while the bullets kept going to the content slide -- so the
+    viewer was parked on the title, and stepping forward to the slide actually
+    being written read as browsing away and paused the recorder.
+    """
+    with DECK_LOCK:
+        slide = current_content_slide()
+        if slide is None and SLIDES:
+            slide = SLIDES[0]
+        return None if slide is None else slide["id"]
 
 
 def slide_state() -> dict[str, Any]:
@@ -214,7 +239,7 @@ def deck_snapshot() -> dict[str, Any]:
         return {
             "version": DECK_VERSION,
             "paused": DECK_PAUSED.is_set(),
-            "active_slide_id": ACTIVE_SLIDE_ID,
+            "active_slide_id": active_slide_id(),
             "slides": [
                 {
                     "id": slide["id"],
@@ -229,29 +254,71 @@ def deck_snapshot() -> dict[str, Any]:
         }
 
 
+ELLIPSIS = "\u2026"
+
+
+def tidy_title(text: str) -> str:
+    """Normalise a title from the model: one ellipsis character marks a provisional one.
+
+    The model is told to end a title it had to cut short with an ellipsis. It
+    writes that as either the character or three periods; the deck keeps one
+    form so a provisional title can be recognised, and so the slide never shows
+    'Tax farming...' next to 'Tax farming\u2026'.
+    """
+    cleaned = text.strip()
+    stripped = cleaned.rstrip(". " + ELLIPSIS)
+    provisional = len(cleaned) - len(stripped) >= 2 or cleaned.endswith(ELLIPSIS)
+    return f"{stripped}{ELLIPSIS}" if provisional and stripped else stripped or cleaned.strip(". ")
+
+
+def is_provisional(title: str) -> bool:
+    return title.endswith(ELLIPSIS)
+
+
+def title_slide() -> dict[str, Any] | None:
+    return next((slide for slide in SLIDES if slide.get("kind") == "title"), None)
+
+
 def create_title_slide(title: str) -> dict[str, Any]:
-    """Create the deck's opening title slide once a clear topic is known."""
+    """Create the deck's title slide, or revise it while the talk is still young.
+
+    The opening words of a talk are almost never its subject -- a greeting, a
+    joke, the run-up -- yet that is when a title is first asked for. So the title
+    is a standing judgement rather than a one-shot: the first plausible one goes
+    up, and a better one replaces it until enough content slides exist that the
+    subject is settled. A one-shot title froze whatever the first fragment was.
+    """
     with DECK_LOCK:
-        cleaned = title.strip()
+        cleaned = tidy_title(title)
         if not cleaned:
             return {"status": "ignored", "reason": "A title is required.", **slide_state()}
-        if any(slide.get("kind") == "title" for slide in SLIDES):
+        existing = title_slide()
+        if existing is None:
+            slide = new_slide("title", cleaned)
+            SLIDES.insert(0, slide)
+            request_slide_image(slide)
+            trace(f"TITLE SLIDE: {cleaned}")
+            return {"status": "created", **slide_state()}
+        if existing["title"] == cleaned:
+            return {"status": "unchanged", **slide_state()}
+        if sum(1 for slide in SLIDES if slide["kind"] != "title") >= TITLE_SETTLES_AFTER_SLIDES:
             return {
                 "status": "ignored",
-                "reason": "The opening title slide already exists.",
+                "reason": f"The title is final once the deck has {TITLE_SETTLES_AFTER_SLIDES} content slides.",
                 **slide_state(),
             }
-        # Recover gracefully if content arrived before the model could name the topic.
-        slide = new_slide("title", cleaned)
-        SLIDES.insert(0, slide)
-        request_slide_image(slide)
-        trace(f"TITLE SLIDE: {cleaned}")
-        return {"status": "created", **slide_state()}
+        trace(f"TITLE SLIDE RETITLED: {existing['title']!r} -> {cleaned!r}")
+        existing["title"] = cleaned
+        # The illustration was chosen for the old title; choose it again.
+        existing.pop("image", None)
+        existing.pop("image_requested", None)
+        request_slide_image(existing)
+        return {"status": "updated", **slide_state()}
 
 
 def append_content_slide(title: str) -> dict[str, Any]:
     with DECK_LOCK:
-        slide = new_slide("content", title)  # also makes it the slide on display
+        slide = new_slide("content", title)  # the last content slide is the one on display
         SLIDES.append(slide)
         trace(f"NEW SLIDE #{len(SLIDES)}: {title}")
         return slide
@@ -260,11 +327,37 @@ def append_content_slide(title: str) -> dict[str, Any]:
 def create_new_slide(title: str) -> dict[str, Any]:
     """Start a new topic in the live deck."""
     with DECK_LOCK:
-        cleaned = title.strip()
+        cleaned = tidy_title(title)
         if not cleaned:
             return {"status": "ignored", "reason": "A slide title is required.", **slide_state()}
         append_content_slide(cleaned)
         return {"status": "created", **slide_state()}
+
+
+def update_slide_title(title: str) -> dict[str, Any]:
+    """Complete or correct the current slide's title.
+
+    A slide sometimes has to open before the speaker has finished naming its
+    subject; that title ends with an ellipsis. Without this tool the Realtime
+    session had no way to finish it, so the ellipsis stayed for the whole talk.
+    """
+    with DECK_LOCK:
+        slide = current_content_slide()
+        cleaned = tidy_title(title)
+        if slide is None:
+            return {"status": "ignored", "reason": "There is no current slide.", **slide_state()}
+        if not cleaned:
+            return {"status": "ignored", "reason": "A slide title is required.", **slide_state()}
+        if slide["title"] == cleaned:
+            return {"status": "unchanged", **slide_state()}
+        trace(f"SLIDE #{SLIDES.index(slide) + 1} RETITLED: {slide['title']!r} -> {cleaned!r}")
+        if is_provisional(slide["title"]):
+            # The picture was chosen for a fragment; choose it again for the subject.
+            slide.pop("image", None)
+            slide.pop("image_requested", None)
+        slide["title"] = cleaned
+        request_slide_image(slide)
+        return {"status": "updated", **slide_state()}
 
 
 def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[str, Any]:
@@ -326,7 +419,25 @@ def update_bullet_point(bullet_number: int, bullet_point: str) -> dict[str, Any]
         return {"status": "updated", "bullet_number": bullet_number, **slide_state()}
 
 
-def find_image(query: str) -> dict[str, str] | None:
+def pick_image(candidates: list[dict[str, str]], rank: int, used: set[str]) -> dict[str, str] | None:
+    """Choose a slide's picture from its search results.
+
+    Result ``rank`` (the slide's position in the deck) is the first choice, so
+    the first slide gets the first relevant picture, the second slide the
+    second, and so on. When the search did not return that many, or that result
+    is already on another slide, the pick is random among what is left -- never
+    the top hit by default, which is what put the same picture on every slide of
+    one subject.
+    """
+    fresh = [item for item in candidates if item["url"] not in used] or candidates
+    if not fresh:
+        return None
+    if rank < len(candidates) and candidates[rank]["url"] not in used:
+        return candidates[rank]
+    return random.choice(fresh[:IMAGE_CANDIDATES])
+
+
+def find_image(query: str, rank: int = 0, used: set[str] | None = None) -> dict[str, str] | None:
     """Return one reusable Commons image. Blocking: never call on the event loop."""
     cleaned = query.strip()
     if not cleaned:
@@ -338,7 +449,7 @@ def find_image(query: str) -> dict[str, str] | None:
             "generator": "search",
             "gsrsearch": cleaned,
             "gsrnamespace": "6",
-            "gsrlimit": "8",
+            "gsrlimit": str(IMAGE_CANDIDATES),
             "prop": "imageinfo",
             "iiprop": "url|mime",
             "iiurlwidth": "1600",
@@ -358,21 +469,29 @@ def find_image(query: str) -> dict[str, str] | None:
         trace(f"IMAGE SEARCH FAILED: {exc}")
         return None
 
-    for page in pages:
+    candidates = []
+    # Search results carry an ``index`` giving their relevance order; the pages
+    # object itself is keyed by page id and arrives in no useful order.
+    for page in sorted(pages, key=lambda item: item.get("index", 0)):
         info = next(iter(page.get("imageinfo", [])), {})
         image_url = info.get("thumburl") or info.get("url")
         # File search also returns audio, video, and PDFs; those have no usable thumbnail.
         if not image_url or not info.get("mime", "").startswith("image/"):
             continue
         title = page.get("title", "")
-        trace(f"IMAGE FOUND: {cleaned}")
-        return {
+        candidates.append({
             "url": image_url,
             "alt": title.removeprefix("File:"),
             "source": f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}",
-        }
-    trace(f"IMAGE NOT FOUND: {cleaned}")
-    return None
+        })
+    chosen = pick_image(candidates, rank, used or set())
+    if chosen is None:
+        trace(f"IMAGE NOT FOUND: {cleaned}")
+        return None
+    position = candidates.index(chosen) + 1
+    how = f"result {position} for slide {rank + 1}" if position == rank + 1 else f"result {position}, random"
+    trace(f"IMAGE FOUND: {cleaned} ({how} of {len(candidates)})")
+    return chosen
 
 
 def image_query(title: str, bullets: list[str]) -> str | None:
@@ -426,7 +545,13 @@ def load_slide_image(slide: dict[str, Any], title: str, bullets: list[str]) -> N
         # Deliberately unillustrated. Leave image_requested set so the slide is
         # not asked about again every time a bullet lands on it.
         return
-    image = find_image(query)
+    with DECK_LOCK:
+        if slide not in SLIDES:
+            return
+        # Read under the lock, used outside it: the search is a network call.
+        rank = SLIDES.index(slide)
+        used = {item["image"]["url"] for item in SLIDES if item.get("image")}
+    image = find_image(query, rank, used)
     if image is None:
         with DECK_LOCK:
             if slide in SLIDES:
@@ -450,6 +575,7 @@ TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "create_new_slide": create_new_slide,
     "new_bullet_point": new_bullet_point,
     "update_bullet_point": update_bullet_point,
+    "update_slide_title": update_slide_title,
 }
 
 # The local display can send the same command as a physical controller. This is
@@ -461,8 +587,11 @@ TOOLS = [
         "type": "function",
         "name": "create_title_slide",
         "description": (
-            "Create the opening title slide once the speaker's initial topic is clear. "
-            "Call this only when has_title_slide is false; do not call it again until the deck resets."
+            "Set the deck's opening title slide: the subject of the whole talk in a few words, "
+            "as a poster would carry it. Never the speaker's opening words, a greeting, or the "
+            "run-up to the subject; wait until the speaker has said what the talk is about. Call "
+            "it again with a better title if the talk turns out to be about something broader or "
+            f"different. The title is final once the deck has {TITLE_SETTLES_AFTER_SLIDES} content slides."
         ),
         "parameters": {
             "type": "object",
@@ -487,7 +616,11 @@ TOOLS = [
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "A short, specific title for the new slide.",
+                    "description": (
+                        "A short, specific title for the new slide: a complete phrase naming its subject. "
+                        "Only when the slide must open before the speaker has finished naming the subject, "
+                        "end it with an ellipsis (\u2026) and finish it with update_slide_title."
+                    ),
                 }
             },
             "required": ["title"],
@@ -543,6 +676,25 @@ TOOLS = [
                 },
             },
             "required": ["bullet_number", "bullet_point"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "update_slide_title",
+        "description": (
+            "Replace the current slide's title: to complete one that ends with an ellipsis (\u2026) "
+            "once the speaker has finished naming the subject, or when they name it more precisely."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The complete replacement title, without an ellipsis.",
+                }
+            },
+            "required": ["title"],
             "additionalProperties": False,
         },
     },
@@ -700,10 +852,13 @@ class RealtimeToolClient:
                         "confident the statement is from the main speaker and can be recorded without adding "
                         "meaning, make no tool call. Do not reinterpret a statement through the lens of the "
                         "current slide's topic. Preserve the speaker's language in every title and bullet: never "
-                        "translate it into English or any other language. As soon as the opening topic is clear, first call "
-                        "create_title_slide with a concise presentation title. Then, when there is a substantive "
-                        "point, create a separate content slide with create_new_slide before adding bullets. Do "
-                        "not make the title slide from a greeting, filler, or an unclear fragment. Add a concise,"
+                        "translate it into English or any other language. Once the speaker has actually said what "
+                        "the talk is about, call create_title_slide with the subject of the talk in a few words, "
+                        "as a poster would carry it -- never their opening words, a greeting, or the run-up such "
+                        "as 'today I want to talk about'. A fragment is not a subject: wait. If the talk later "
+                        "proves to be about something broader or different, call create_title_slide again with "
+                        "the better title. When there is a substantive point, create a separate content slide "
+                        "with create_new_slide before adding bullets. Add a concise,"
                         " standalone bullet only for substantive, sufficiently complete ideas. Do not add bullets"
                         " for filler, false starts, or repetition. When later speech corrects or meaningfully "
                         "refines a current-slide bullet, use update_bullet_point instead of adding a duplicate. "
@@ -716,6 +871,12 @@ class RealtimeToolClient:
                         "new_bullet_point and the deck rolls the overflow onto a continuation slide by itself. "
                         "Never call create_new_slide just to make room, though -- a new slide is for a new "
                         "subject, and its title comes from what the speaker starts saying after the transition. "
+                        "A slide title is a complete phrase that names the subject. Prefer to wait for the "
+                        "speaker to finish naming a new subject before opening its slide; only when the "
+                        "subject has plainly changed but its name is still cut off, open the slide with the "
+                        "words so far ending in an ellipsis (\u2026), then call update_slide_title with the "
+                        "complete title as soon as the speaker finishes it. A complete title never carries "
+                        "an ellipsis. "
                         "Treat a clear, "
                         "explicitly stated change of subject, entity, timeframe, or question as a new topic; do "
                         "not force it into the current slide or rewrite a current bullet merely because it was "
@@ -1051,7 +1212,6 @@ EDITOR_SYSTEM = (
     "never be where a new topic starts. "
     "Reply with one JSON object choosing an action: "
     "'none' when the span adds nothing worth showing; "
-    "'title' for the deck's opening title slide, once, when the subject first becomes clear; "
     "'update' to rewrite the current slide; "
     "'new' when the subject has changed, which freezes the finished slide and opens "
     "the next one from your title and bullets. "
@@ -1080,8 +1240,26 @@ EDITOR_SYSTEM = (
     "is filler: ignore it and keep updating. On 'new', title and fill the slide from "
     "what was said after the hand-off only, and leave bullets empty if the speaker has "
     "so far only named the topic; never carry the old subject's points across. "
+    "A title is a complete phrase that names the slide's subject. Prefer a complete "
+    "title: when the speaker has only begun to name the new subject and the rest is "
+    "surely one pass away, that fragment is not yet a subject, so wait. Only when the "
+    "subject has plainly changed but its name is still cut off does the slide open with "
+    "the words so far ending in an ellipsis (\u2026) to mark the title provisional; complete "
+    "it, dropping the ellipsis, on the next pass. A complete title never carries one. "
     "A single offhand remark belonging to neither slide is not a transition -- start a "
-    "new slide for it only once it grows into a discussion of its own."
+    "new slide for it only once it grows into a discussion of its own. "
+    # Measured: asked for the title as a one-shot action, the model named the deck
+    # from the first four words heard -- a greeting or a run-up, frozen for the
+    # whole talk. The title is answered on every call instead, last, with the
+    # content already written, so it is judged against everything said so far.
+    "Finally, 'deck_title' is the deck's opening slide: the subject of the whole talk in "
+    "a few words, as a poster would carry it. It is never the speaker's opening words -- "
+    "a greeting, a joke, or the run-up such as 'today I want to talk about' -- and a "
+    "fragment is not a subject. Leave it empty until the speaker has actually said what "
+    "the talk is about -- it can wait, so it is always complete and never ends in an "
+    "ellipsis. You are shown the current one as 'deck_title'; repeat it unchanged "
+    "unless the talk has plainly turned out to be about something broader or different, "
+    "in which case give the better title."
 )
 
 EDITOR_SCHEMA = {
@@ -1103,11 +1281,23 @@ EDITOR_SCHEMA = {
                     "type": "boolean",
                     "description": "True only if recent_subject is the subject the current slide already covers.",
                 },
-                "action": {"type": "string", "enum": ["none", "title", "update", "new"]},
-                "title": {"type": "string"},
+                "action": {"type": "string", "enum": ["none", "update", "new"]},
+                "title": {
+                    "type": "string",
+                    "description": "The slide's title: a complete phrase, ending with \u2026 only while provisional.",
+                },
                 "bullets": {"type": "array", "items": {"type": "string"}},
+                # Last on purpose: the subject of the whole talk is judged after
+                # the content, with everything said so far in view.
+                "deck_title": {
+                    "type": "string",
+                    "description": (
+                        "The subject of the whole talk in a few words. "
+                        "Empty until the speaker has said what it is about."
+                    ),
+                },
             },
-            "required": ["recent_subject", "continues_current_slide", "action", "title", "bullets"],
+            "required": ["recent_subject", "continues_current_slide", "action", "title", "bullets", "deck_title"],
             "additionalProperties": False,
         },
     },
@@ -1239,7 +1429,8 @@ def request_slide_image(slide: dict[str, Any]) -> None:
 
 
 def continued_title(title: str) -> str:
-    return title if title.lower().endswith("(continued)") else f"{title} (continued)"
+    base = title.removesuffix(ELLIPSIS).rstrip()
+    return title if title.lower().endswith("(continued)") else f"{base} (continued)"
 
 
 def fill_slide(slide: dict[str, Any], title: str, bullets: list[str]) -> bool:
@@ -1256,6 +1447,10 @@ def fill_slide(slide: dict[str, Any], title: str, bullets: list[str]) -> bool:
         head, overflow = bullets[:MAX_BULLETS_PER_SLIDE], bullets[MAX_BULLETS_PER_SLIDE:]
         if (slide["title"], slide["bullets"]) != (title, head):
             old_title, old_bullets = slide["title"], list(slide["bullets"])
+            if old_title != title and is_provisional(old_title):
+                # The picture was chosen for a fragment; choose it again for the subject.
+                slide.pop("image", None)
+                slide.pop("image_requested", None)
             slide["title"] = title
             slide["bullets"] = head
             request_slide_image(slide)
@@ -1285,17 +1480,21 @@ def fill_slide(slide: dict[str, Any], title: str, bullets: list[str]) -> bool:
 
 def apply_edit(edit: dict[str, Any], stream: TranscriptStream, mark: int) -> int:
     """Fold one editor decision into the deck; return the new transcript mark."""
-    global ACTIVE_SLIDE_ID
     action = edit.get("action", "none")
-    title = (edit.get("title") or "").strip()
+    title = tidy_title(edit.get("title") or "")
     bullets = [b.strip() for b in edit.get("bullets", []) if b and b.strip()]
+    deck_title = tidy_title(edit.get("deck_title") or "")
 
+    with DECK_LOCK:
+        # The title stands apart from the action, so naming the talk never costs
+        # a tick of content. On an empty deck ``mark`` is where the talk began,
+        # so the floor measures the whole of it; once anything is on the deck,
+        # the subject has been spoken about and the floor no longer applies.
+        if deck_title and (SLIDES or len(stream.text_since(mark).split()) >= MIN_WORDS_FOR_TITLE):
+            create_title_slide(deck_title)
     if action == "none" or not title:
         return mark
     with DECK_LOCK:
-        if action == "title":
-            create_title_slide(title)
-            return mark
         if action == "new":
             # CMD_NEXT creates an empty visible destination immediately. The
             # next editor result belongs there; appending again would leave a
@@ -1306,10 +1505,6 @@ def apply_edit(edit: dict[str, Any], stream: TranscriptStream, mark: int) -> int
                 if current is not None and not current["title"].strip() and not current["bullets"]
                 else append_content_slide(title)
             )
-            # Reusing the blank destination creates no slide, so nothing has
-            # moved the pointer. Naming a blank slide still starts a topic, and
-            # the deck must be showing it even if a viewer has browsed away.
-            ACTIVE_SLIDE_ID = target["id"]
             fill_slide(target, title, bullets)
             # A new slide means the previous one is finished: measure the next
             # slide's span from here rather than replaying the whole talk.
@@ -1486,12 +1681,10 @@ def deck_command_handler(stream: TranscriptStream, state: dict[str, Any],
             state["last_text"] = ""
 
     def handle(command: str) -> None:
-        global ACTIVE_SLIDE_ID
         if command == "CMD_WIPE":
             with DECK_LOCK:
                 SLIDES.clear()
                 mark_deck_changed()
-                ACTIVE_SLIDE_ID = None
             stream.discard_pending()
             close_current_slide()
             trace("COMMAND CMD_WIPE: deck cleared.")
@@ -1632,7 +1825,7 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
                 "recent_slides": [
                     {"title": item["title"], "bullets": list(item["bullets"])} for item in detailed
                 ],
-                "has_title_slide": any(item["kind"] == "title" for item in SLIDES),
+                "deck_title": (title_slide() or {}).get("title", ""),
                 "current_slide": None
                 if current is None
                 else {"title": current["title"], "bullets": list(current["bullets"])},
@@ -1671,7 +1864,8 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
             trace(
                 f"EDITOR #{sequence} (generation {generation}): heard={edit.get('recent_subject', '')!r}, "
                 f"same slide={edit.get('continues_current_slide')}, action={edit.get('action')!r}, "
-                f"title={edit.get('title', '')!r}, bullets={len(edit.get('bullets', []))}."
+                f"title={edit.get('title', '')!r}, bullets={len(edit.get('bullets', []))}, "
+                f"deck_title={edit.get('deck_title', '')!r}."
             )
             state["applied"] = sequence
             moved = apply_edit(edit, stream, state["mark"])

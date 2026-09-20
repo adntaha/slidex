@@ -14,8 +14,8 @@ pipenv run python slidex.py --microphone --web
 ```
 
 Then open <http://127.0.0.1:8000>. Use `←`/`→`, `Space`, or the on-screen
-buttons to move between slides; the view jumps to a slide when it is created
-and otherwise stays where you left it.
+buttons to move between slides; the view follows the slide being written and
+otherwise stays where you left it.
 
 Microphone capture needs the PortAudio runtime (`sudo apt-get install
 libportaudio2` on Debian/Ubuntu).
@@ -107,7 +107,12 @@ pipenv run python slidex.py --transcribe --web
 ```
 
 Only the slide being written is mutable; finished slides are frozen, so the deck
-does not churn behind the speaker.
+does not churn behind the speaker. The title slide is the exception while the
+talk is young: it names the subject of the whole talk, so it is left blank until
+the speaker has said what that is, and may be retitled until three content
+slides exist. A slide title is a complete phrase; when a slide has to open before
+the speaker has finished naming its subject, the title ends with an ellipsis and
+is completed on a later pass.
 
 Editor calls overlap, so one slow request cannot stall the deck. Because answers
 can then arrive out of order, each carries the revision it was written against:
@@ -129,6 +134,9 @@ transcript stream if you want to check transcription quality on its own.
   type and spacing scale with the slide rather than the window, and a measured
   auto-fit pass shrinks any text block that still would not fit.
 
-Images are fetched on background threads and credited on the slide. Nothing
+Images are fetched on background threads and credited on the slide. Each search
+returns ten candidates and slide N takes the Nth, skipping pictures already on
+the deck, so similar slides are not all illustrated with the same top hit; when
+there is no Nth result the pick is random from the ten. Nothing
 that touches the network runs on the Realtime event loop: a slow lookup there
 would stall every response and back the microphone up behind it.
