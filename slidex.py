@@ -79,6 +79,58 @@ MAX_TOOL_ROUNDS = 4
 # Slides alternate sides so a run of illustrated slides has some visual rhythm.
 IMAGE_PLACEMENTS = ("right", "left")
 IMAGE_SEARCH_TIMEOUT = 12
+IMAGE_QUERY_MODEL = "gpt-4.1-mini"  # a naming task, and it runs off the critical path
+IMAGE_QUERY_TIMEOUT = 12
+
+IMAGE_QUERY_SYSTEM = (
+    "You turn one presentation slide into a search query for Wikimedia Commons, a "
+    "library of photographs, maps and diagrams. "
+    "Name the most concrete photographable thing the slide is about, in two to five "
+    "words: an object, place, animal, person, machine or event. Search in English "
+    "whatever language the slide is written in, because that is the language Commons "
+    "is catalogued in. "
+    # A slide's own words are the talk's vocabulary, not a picture's. Searching them
+    # verbatim is what returned a wedding ceremony for a slide titled "Introduction".
+    "Ignore the words that describe a slide's role in a talk rather than its subject "
+    "-- overview, introduction, summary, agenda, next steps, challenges, approach, "
+    "conclusion, results -- and look at what the bullets are actually about. Prefer a "
+    "physical thing over an abstraction: for a slide about streaming audio from a "
+    "microcontroller, 'ESP32 microcontroller board' will find a picture and "
+    "'audio streaming architecture' will not. "
+    "Plenty of slides have no subject worth a picture: an agenda, a greeting, a list "
+    "of abstract goals. Set 'depictable' to false for those and leave the query empty. "
+    "A confidently wrong photograph on a presentation screen is worse than no "
+    "photograph at all."
+)
+
+IMAGE_QUERY_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "image_query",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            # 'subject' first: naming what the slide is about before judging whether
+            # it can be pictured stops an abstract title being waved through.
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": "What the slide is about, ignoring presentation scaffolding words.",
+                },
+                "depictable": {
+                    "type": "boolean",
+                    "description": "Whether a photograph, map or diagram of that subject would mean anything.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Two to five English words to search Commons for. Empty if not depictable.",
+                },
+            },
+            "required": ["subject", "depictable", "query"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 SLIDES: list[dict[str, Any]] = []
 DECK_LOCK = threading.RLock()
@@ -99,10 +151,17 @@ def mark_deck_changed() -> None:
 
 
 def new_slide(kind: str, title: str) -> dict[str, Any]:
-    """Build a slide with an id that survives the renumbering an insert causes."""
-    global _LAST_SLIDE_ID
+    """Build a slide with an id that survives the renumbering an insert causes.
+
+    Whatever slide the deck has just gained is the one to show: the speaker is
+    already talking to it. The follow happens here, at the single point a slide
+    is born, rather than at each call site that creates one -- a call site that
+    forgets leaves the new slide drawn somewhere off-screen.
+    """
+    global _LAST_SLIDE_ID, ACTIVE_SLIDE_ID
     with DECK_LOCK:
         _LAST_SLIDE_ID += 1
+        ACTIVE_SLIDE_ID = _LAST_SLIDE_ID
         mark_deck_changed()
         return {"id": _LAST_SLIDE_ID, "kind": kind, "title": title, "bullets": []}
 
@@ -183,17 +242,17 @@ def create_title_slide(title: str) -> dict[str, Any]:
                 **slide_state(),
             }
         # Recover gracefully if content arrived before the model could name the topic.
-        SLIDES.insert(0, new_slide("title", cleaned))
+        slide = new_slide("title", cleaned)
+        SLIDES.insert(0, slide)
+        request_slide_image(slide)
         trace(f"TITLE SLIDE: {cleaned}")
         return {"status": "created", **slide_state()}
 
 
 def append_content_slide(title: str) -> dict[str, Any]:
-    global ACTIVE_SLIDE_ID
     with DECK_LOCK:
-        slide = new_slide("content", title)
+        slide = new_slide("content", title)  # also makes it the slide on display
         SLIDES.append(slide)
-        ACTIVE_SLIDE_ID = slide["id"]
         trace(f"NEW SLIDE #{len(SLIDES)}: {title}")
         return slide
 
@@ -226,22 +285,18 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
 
         slide = current_content_slide()
         assert slide is not None
-        if len(slide["bullets"]) >= MAX_BULLETS_PER_SLIDE:
-            return {
-                "status": "ignored",
-                "reason": (
-                    "The current slide is full. Do not create a continuation slide; "
-                    "wait for a genuinely new topic and create a newly titled slide."
-                ),
-                **slide_state(),
-            }
+        # A full slide must not swallow what the speaker just said. Refusing the
+        # bullet loses the point outright, so the overflow opens the next slide.
+        rolled = len(slide["bullets"]) >= MAX_BULLETS_PER_SLIDE
+        if rolled:
+            slide = append_content_slide(continued_title(slide["title"]))
         slide["bullets"].append(cleaned)
+        if rolled:
+            trace(f"SLIDE #{len(SLIDES)} '{slide['title']}': rolled over, the slide before was full")
         trace(f"BULLET #{len(slide['bullets'])}: • {cleaned}")
-        # Illustrate each content slide once, in the background. The tool result
-        # does not wait for it; the browser poll picks the image up when it lands.
-        if not slide.get("image_requested"):
-            slide["image_requested"] = True
-            IMAGE_WORKERS.submit(load_slide_image, slide, f"{slide['title']} {cleaned}")
+        # Image lookup happens in the background and retries when earlier search
+        # terms found nothing, so every completed slide gets an illustration.
+        request_slide_image(slide)
         return {
             "status": "saved",
             "bullet_number": len(slide["bullets"]),
@@ -291,7 +346,10 @@ def find_image(query: str) -> dict[str, str] | None:
     )
     request = Request(
         f"https://commons.wikimedia.org/w/api.php?{params}",
-        headers={"User-Agent": "Slidex/1.0 (local presentation tool)"},
+        # Wikimedia's User-Agent policy wants a contact it can reach. A generic
+        # agent gets throttled to 429s, which read here exactly like "no such
+        # picture" and quietly leave a whole talk unillustrated.
+        headers={"User-Agent": "Slidex/1.0 (https://github.com/adntaha/slidex)"},
     )
     try:
         with urlopen(request, timeout=IMAGE_SEARCH_TIMEOUT) as response:  # noqa: S310 - fixed Wikimedia endpoint
@@ -317,16 +375,72 @@ def find_image(query: str) -> dict[str, str] | None:
     return None
 
 
-def load_slide_image(slide: dict[str, Any], query: str) -> None:
-    """Background worker: illustrate one slide, or quietly leave it text-only."""
+def image_query(title: str, bullets: list[str]) -> str | None:
+    """Turn a slide into words Wikimedia Commons can actually match.
+
+    Searching the slide's own text searches the talk's vocabulary rather than for
+    a picture, which is how a slide titled "Introduction" ended up illustrated
+    with a wedding ceremony. Returns None when the slide is not worth a picture,
+    and falls back to the slide's own words if the call fails -- a slow network
+    should cost a better query, not the image.
+    """
+    fallback = " ".join(part for part in (title, *bullets[:2]) if part.strip())
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return fallback
+    body = json.dumps(
+        {
+            "model": IMAGE_QUERY_MODEL,
+            "messages": [
+                {"role": "system", "content": IMAGE_QUERY_SYSTEM},
+                {"role": "user", "content": json.dumps({"title": title, "bullets": bullets})},
+            ],
+            "response_format": IMAGE_QUERY_SCHEMA,
+            "max_completion_tokens": 200,
+        }
+    ).encode()
+    request = Request(
+        EDITOR_URL,
+        data=body,
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=IMAGE_QUERY_TIMEOUT) as response:  # noqa: S310 - fixed OpenAI endpoint
+            answer = json.loads(json.load(response)["choices"][0]["message"]["content"])
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        trace(f"IMAGE QUERY FAILED: {exc}; searching the slide's own words instead.")
+        return fallback
+    if not answer.get("depictable"):
+        trace(f"IMAGE SKIPPED for '{title}': {answer.get('subject', '')!r} is not worth a picture.")
+        return None
+    query = (answer.get("query") or "").strip()
+    trace(f"IMAGE QUERY for '{title}': {query!r}")
+    return query or fallback
+
+
+def load_slide_image(slide: dict[str, Any], title: str, bullets: list[str]) -> None:
+    """Background worker: illustrate one slide and leave failures retryable."""
+    query = image_query(title, bullets)
+    if query is None:
+        # Deliberately unillustrated. Leave image_requested set so the slide is
+        # not asked about again every time a bullet lands on it.
+        return
     image = find_image(query)
     if image is None:
+        with DECK_LOCK:
+            if slide in SLIDES:
+                slide.pop("image_requested", None)
+                trace(f"IMAGE DEFERRED for slide {slide['id']}; will retry with more context.")
         return
     with DECK_LOCK:
         if slide not in SLIDES or "image" in slide:
             return
-        rank = [item for item in SLIDES if item["kind"] == "content"].index(slide)
-        placement = IMAGE_PLACEMENTS[rank % len(IMAGE_PLACEMENTS)]
+        if slide["kind"] == "title":
+            placement = "background"
+        else:
+            rank = [item for item in SLIDES if item["kind"] == "content"].index(slide)
+            placement = IMAGE_PLACEMENTS[rank % len(IMAGE_PLACEMENTS)]
         slide["image"] = {**image, "placement": placement}
         trace(f"IMAGE PLACED on slide {slide['id']} / {placement}")
 
@@ -598,12 +712,17 @@ class RealtimeToolClient:
                         "When one coherent topic is finished and the speaker begins a genuinely new topic, call "
                         "create_new_slide with a short title before adding that topic's bullets. Earlier slides "
                         "are immutable: never retitle, edit, or add bullets to a slide once a newer content slide "
-                        "exists. Never create a '(continued)' slide merely because the current slide is full; wait "
-                        "for a genuinely new topic and give that new slide a title based on what the speaker starts "
-                        "saying after the transition. Treat a clear, "
+                        "exists. Never stop recording a point because the slide looks full: keep calling "
+                        "new_bullet_point and the deck rolls the overflow onto a continuation slide by itself. "
+                        "Never call create_new_slide just to make room, though -- a new slide is for a new "
+                        "subject, and its title comes from what the speaker starts saying after the transition. "
+                        "Treat a clear, "
                         "explicitly stated change of subject, entity, timeframe, or question as a new topic; do "
                         "not force it into the current slide or rewrite a current bullet merely because it was "
-                        "the latest one. Every tool result lists the whole deck: check it before assuming the "
+                        "the latest one. Ignore isolated offhand remarks that neither support the current topic "
+                        "nor establish a new one. If those remarks become a sustained, coherent discussion, then "
+                        "create a new slide with a title for that new topic. "
+                        "Every tool result lists the whole deck: check it before assuming the "
                         "speaker is still on the current slide's subject. Do not make a new slide merely because of a pause. Use tools rather "
                         "than prose, but making no call at all is the correct and expected answer whenever "
                         "nothing new was clearly said."
@@ -871,39 +990,98 @@ TRANSCRIBE_MODEL = "gpt-live-transcribe"
 # not both.
 VAD_CAPABLE_MODELS = ("gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1")
 TRANSCRIBE_COMMIT_SECONDS = 8.0
-EDITOR_MODEL = "gpt-4.1-mini"
+# Measured on the transition cases: gpt-4.1-mini folded a new subject into the
+# open slide on 2 of 6, while gpt-4.1 took all 6 -- and did it in less time
+# (median 0.80s against 0.96s), so there is nothing to trade away here.
+EDITOR_MODEL = "gpt-4.1"
 EDITOR_URL = "https://api.openai.com/v1/chat/completions"
 EDITOR_TIMEOUT = 25
 EDITOR_WORKERS = 3  # editor calls overlap; see the staleness guards in run_transcription_mode
-EDITOR_MAX_TOKENS = 400
+# A structured response containing non-Latin text can be longer than its visual
+# slide content suggests. Leave enough room that JSON is not cut inside a
+# Unicode escape sequence.
+EDITOR_MAX_TOKENS = 800
 DETAILED_SLIDES_IN_PAYLOAD = 2  # older slides contribute titles only, so the prompt stays flat
 
+# The judgement this prompt exists to get right is that 'so', 'okay', 'now' and
+# 'anyway' open a new topic about as often as they open nothing at all, so the
+# decision is keyed on whether a different subject follows the phrase rather than
+# on the phrase itself. Rules are stated once: a restated rule reads to the model
+# as a second, subtly different rule.
 EDITOR_SYSTEM = (
     "You maintain one slide of a live deck being built from a talk as it happens. "
     "You are given the titles of earlier slides, the last few finished slides in full, "
     "the slide currently being written, and the transcript of everything said since "
     "that slide started. "
-    "Rewrite the current slide so it reflects that transcript. Record only what the "
-    "speaker actually said: never add a fact, entity, or theme that is not in the "
-    "transcript. Ignore filler, false starts, repetition, and anything that reads "
-    "like background conversation. "
-    "Preserve the transcript's original language in every title and bullet. Never translate it into English "
-    "or any other language. "
-    "Keep bullets short and standalone, and keep wording stable between calls -- "
-    "you are shown your own previous output, and rewording it for no reason makes "
-    "the deck flicker for the audience. Preserve existing detailed bullets verbatim unless the speaker explicitly "
-    "corrects or substantially refines that specific point; do not rewrite them just to improve style or coverage. "
-    f"A slide shows {MAX_BULLETS_PER_SLIDE} bullets. If the speaker has said more than "
-    f"fits, list all of it anyway: the deck rolls whatever does not fit onto a "
-    f"continuation slide, so nothing is lost. Never drop a point to stay under the limit. "
+    # Without this the model narrates the talk instead of captioning it: real runs
+    # produced "Speaker intends to avoid a jokey tone" from "we're gonna be fun".
+    "Write slides, not minutes. A bullet is a short phrase an audience takes in at a "
+    "glance, not a sentence copied out of the transcript and not a report of what the "
+    "speaker did. Compress each point to its content: keep names, numbers and "
+    "technical terms exactly as spoken, and drop the scaffolding around them -- "
+    "'I think', 'we should', 'what I want to say is'. Never describe the speaker in "
+    "the third person; state the point itself. "
+    "Ground every word in the transcript: never add a fact, entity or theme that is "
+    "not there. "
+    # A speaker does not change language mid-talk, so a span that looks like one is
+    # almost always the transcriber slipping. Anchoring on the deck rather than on
+    # the span stops one bad span from turning the deck bilingual.
+    "The deck is written in one language throughout: the language of the talk, which "
+    "the existing slides already establish. Never translate the deck into another "
+    "language, and never mix two. A speaker does not switch language mid-talk, so "
+    "when a span looks like a different language it is a mis-transcription or a "
+    "quoted foreign term -- keep writing in the language the deck is already in. "
+    "Proper nouns and technical terms stay exactly as spoken. "
+    "Speech carries a great deal that means nothing on a slide: hesitations, restarts, "
+    "self-repetition, hedges, and asides to the room. Strip it. When a span is only "
+    "that, answer 'none' and leave the slide untouched. "
+    "Keep wording stable between calls. You are shown your own previous output; leave "
+    "an existing bullet exactly as it stands unless the speaker corrected it or "
+    "genuinely advanced that point, because rewording for style alone makes the deck "
+    "flicker in front of the audience. "
+    # Measured: with the rollover advertised and nothing said about its limits, a
+    # full slide plus a transition came back as 'update' with six bullets, and the
+    # next topic landed on a slide titled "(continued)" after the previous one.
+    f"A slide shows {MAX_BULLETS_PER_SLIDE} bullets. When one subject genuinely runs "
+    "longer than that, list it all anyway -- the deck rolls the remainder onto a "
+    "continuation slide, so never drop a point to stay under the limit. That overflow "
+    "is for one subject that will not fit, never for a second subject: if the speaker "
+    "has moved on, answer 'new' instead of adding their new subject to a full slide. "
+    "A full slide is not a reason to choose 'update', and a continuation slide must "
+    "never be where a new topic starts. "
     "Reply with one JSON object choosing an action: "
-    "'none' when the transcript adds nothing worth showing; "
+    "'none' when the span adds nothing worth showing; "
     "'title' for the deck's opening title slide, once, when the subject first becomes clear; "
     "'update' to rewrite the current slide; "
-    "'new' when the speaker has clearly moved to a different subject, in which case "
-    "the finished slide is frozen and your title and bullets begin the next one. "
-    "Treat explicit transitions such as 'moving on', 'next', 'let's talk about', or 'now I will discuss' "
-    "as a mandatory 'new' action, even when the previous slide is not full."
+    "'new' when the subject has changed, which freezes the finished slide and opens "
+    "the next one from your title and bullets. "
+    # Measured: given one span four parts old subject to one part new, the model
+    # folded the new subject in as a sixth bullet every time, however the rule was
+    # worded. Restating the current slide is simply the cheapest thing it can emit.
+    # So the boundary is settled in its own fields, which the schema puts before
+    # the content: having named the subject, it cannot quietly file it under the
+    # old title.
+    "You get two views of the speech. 'recent_speech' is what has been said since your "
+    "last decision -- that is where the speaker is now. "
+    "'transcript_since_slide_started' is everything since the current slide began; use "
+    "it only to keep the bullets you carry forward accurate. "
+    "Answer the fields in order. In 'recent_subject', name what 'recent_speech' is "
+    "about in a few words, leaving it empty when that is only filler. Then set "
+    "'continues_current_slide': true only when 'recent_subject' is the same subject "
+    "the current slide already covers. When it is false and 'recent_subject' is not "
+    "empty, 'action' must be 'new' -- a slide holds one subject and one only, so "
+    "never append a second subject to it as a further bullet, however much of the "
+    "longer transcript came before it. "
+    "Decide this on the subject, never on the phrasing. A phrase like 'so', 'okay', "
+    "'now', 'right' or 'anyway' is a hand-off only when a subject the current slide "
+    "does not cover follows it -- 'moving on to X', 'next', \"let's talk about X\", "
+    "'that brings me to X', 'switching gears'. Then answer 'new' even if the current "
+    "slide is nearly empty. When more of the same subject follows instead, the phrase "
+    "is filler: ignore it and keep updating. On 'new', title and fill the slide from "
+    "what was said after the hand-off only, and leave bullets empty if the speaker has "
+    "so far only named the topic; never carry the old subject's points across. "
+    "A single offhand remark belonging to neither slide is not a transition -- start a "
+    "new slide for it only once it grows into a discussion of its own."
 )
 
 EDITOR_SCHEMA = {
@@ -913,12 +1091,23 @@ EDITOR_SCHEMA = {
         "strict": True,
         "schema": {
             "type": "object",
+            # Order matters: these are generated in sequence, so naming the subject
+            # and judging the boundary happen before any slide content exists to
+            # be anchored on. Reversing them puts the decision after the answer.
             "properties": {
+                "recent_subject": {
+                    "type": "string",
+                    "description": "What recent_speech is about, in a few words. Empty if it is only filler.",
+                },
+                "continues_current_slide": {
+                    "type": "boolean",
+                    "description": "True only if recent_subject is the subject the current slide already covers.",
+                },
                 "action": {"type": "string", "enum": ["none", "title", "update", "new"]},
                 "title": {"type": "string"},
                 "bullets": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["action", "title", "bullets"],
+            "required": ["recent_subject", "continues_current_slide", "action", "title", "bullets"],
             "additionalProperties": False,
         },
     },
@@ -1041,10 +1230,12 @@ def edit_deck(api_key: str, model: str, payload: dict[str, Any]) -> dict[str, An
 
 
 def request_slide_image(slide: dict[str, Any]) -> None:
-    """Illustrate a slide once, in the background, as soon as it has content."""
-    if slide["bullets"] and not slide.get("image_requested"):
+    """Illustrate every titled or populated slide once, in the background."""
+    if (slide["title"].strip() or slide["bullets"]) and not slide.get("image_requested"):
         slide["image_requested"] = True
-        IMAGE_WORKERS.submit(load_slide_image, slide, f"{slide['title']} {slide['bullets'][0]}")
+        # Hand over a snapshot, not the slide: naming the query is a network call
+        # and this runs with DECK_LOCK held, so none of it can happen here.
+        IMAGE_WORKERS.submit(load_slide_image, slide, slide["title"], list(slide["bullets"]))
 
 
 def continued_title(title: str) -> str:
@@ -1064,10 +1255,20 @@ def fill_slide(slide: dict[str, Any], title: str, bullets: list[str]) -> bool:
     with DECK_LOCK:
         head, overflow = bullets[:MAX_BULLETS_PER_SLIDE], bullets[MAX_BULLETS_PER_SLIDE:]
         if (slide["title"], slide["bullets"]) != (title, head):
+            old_title, old_bullets = slide["title"], list(slide["bullets"])
             slide["title"] = title
             slide["bullets"] = head
             request_slide_image(slide)
             trace(f"SLIDE #{SLIDES.index(slide) + 1} '{title}': {len(head)} bullet(s)")
+            changed = [str(index + 1) for index, (old, new) in enumerate(zip(old_bullets, head)) if old != new]
+            detail = (
+                f"title={'changed' if old_title != title else 'unchanged'}, "
+                f"bullets {len(old_bullets)}→{len(head)}, "
+                f"revised={','.join(changed) or 'none'}, "
+                f"added={max(0, len(head) - len(old_bullets))}, "
+                f"removed={max(0, len(old_bullets) - len(head))}"
+            )
+            trace(f"SLIDE CHANGE #{SLIDES.index(slide) + 1}: {detail}")
 
         spilled = False
         rolling = title
@@ -1084,6 +1285,7 @@ def fill_slide(slide: dict[str, Any], title: str, bullets: list[str]) -> bool:
 
 def apply_edit(edit: dict[str, Any], stream: TranscriptStream, mark: int) -> int:
     """Fold one editor decision into the deck; return the new transcript mark."""
+    global ACTIVE_SLIDE_ID
     action = edit.get("action", "none")
     title = (edit.get("title") or "").strip()
     bullets = [b.strip() for b in edit.get("bullets", []) if b and b.strip()]
@@ -1104,6 +1306,10 @@ def apply_edit(edit: dict[str, Any], stream: TranscriptStream, mark: int) -> int
                 if current is not None and not current["title"].strip() and not current["bullets"]
                 else append_content_slide(title)
             )
+            # Reusing the blank destination creates no slide, so nothing has
+            # moved the pointer. Naming a blank slide still starts a topic, and
+            # the deck must be showing it even if a viewer has browsed away.
+            ACTIVE_SLIDE_ID = target["id"]
             fill_slide(target, title, bullets)
             # A new slide means the previous one is finished: measure the next
             # slide's span from here rather than replaying the whole talk.
@@ -1254,7 +1460,10 @@ def esp32_audio(args: argparse.Namespace, deliver: Callable[[bytes], None],
         link.close()
 
 
-DECK_COMMANDS = ("CMD_WIPE", "CMD_PAUSE", "CMD_NEXT")
+# CMD_PAUSE toggles, which is what a single hardware button needs. The display
+# must not use it: a viewer browsing back has no idea which way a toggle will
+# land, and guessing wrong mutes the talk for good. It says what it wants instead.
+DECK_COMMANDS = ("CMD_WIPE", "CMD_PAUSE", "CMD_PAUSE_ON", "CMD_PAUSE_OFF", "CMD_NEXT")
 COMMAND_PORT = 5005  # the port parse_audio.py already publishes button presses on
 
 
@@ -1272,7 +1481,7 @@ def deck_command_handler(stream: TranscriptStream, state: dict[str, Any],
         # edit starts from a blank slide, and any edit still in flight against
         # the old one is discarded rather than landing on the new one.
         with state_lock:
-            state["mark"] = stream.mark()
+            state["mark"] = state["seen"] = stream.mark()
             state["generation"] += 1
             state["last_text"] = ""
 
@@ -1294,13 +1503,13 @@ def deck_command_handler(stream: TranscriptStream, state: dict[str, Any],
                 append_content_slide("")
             close_current_slide()
             trace("COMMAND CMD_NEXT: blank slide created and selected.")
-        elif command == "CMD_PAUSE":
-            if paused.is_set():
-                paused.clear()
-                trace("COMMAND CMD_PAUSE: resumed, audio is flowing again.")
-            else:
-                paused.set()
-                trace("COMMAND CMD_PAUSE: paused, audio is being dropped.")
+        elif command in ("CMD_PAUSE", "CMD_PAUSE_ON", "CMD_PAUSE_OFF"):
+            wanted = not paused.is_set() if command == "CMD_PAUSE" else command == "CMD_PAUSE_ON"
+            if wanted == paused.is_set():
+                return  # already there; say nothing rather than repeat the trace
+            paused.set() if wanted else paused.clear()
+            trace(f"COMMAND {command}: "
+                  + ("paused, audio is being dropped." if wanted else "resumed, audio is flowing again."))
         else:
             trace(f"Ignoring unknown deck command {command!r}")
 
@@ -1377,7 +1586,7 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
     # has since been closed, whose transcript span now belongs to the slide before.
     state = {
         "mark": 0, "generation": 0, "applied": 0, "issued": 0, "in_flight": 0,
-        "last_text": "",
+        "last_text": "", "seen": 0,
     }
     state_lock = threading.Lock()
 
@@ -1412,7 +1621,7 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
             appended.clear()
             stream.send({"type": "input_audio_buffer.commit"})
 
-    def build_payload(spoken: str) -> dict[str, Any]:
+    def build_payload(spoken: str, recent: str) -> dict[str, Any]:
         with DECK_LOCK:
             current = current_content_slide()
             finished = [item for item in SLIDES if item is not current]
@@ -1427,6 +1636,10 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
                 "current_slide": None
                 if current is None
                 else {"title": current["title"], "bullets": list(current["bullets"])},
+                # Where the speaker is now, kept apart from the whole span. The
+                # span is mostly the current subject by construction, and the
+                # editor judged the boundary by bulk when shown only that.
+                "recent_speech": recent,
                 "transcript_since_slide_started": spoken,
             }
 
@@ -1444,15 +1657,26 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
             with state_lock:
                 state["in_flight"] -= 1
         if edit is None:
+            # Let the same transcript be retried. Without this, a malformed or
+            # length-truncated JSON response leaves last_text set forever and
+            # the slide never receives the speech that caused the failure.
+            with state_lock:
+                if generation == state["generation"]:
+                    state["last_text"] = ""
             return
         with state_lock:
             if sequence <= state["applied"] or generation != state["generation"]:
                 trace(f"Discarding edit #{sequence}: a newer one already landed.")
                 return
+            trace(
+                f"EDITOR #{sequence} (generation {generation}): heard={edit.get('recent_subject', '')!r}, "
+                f"same slide={edit.get('continues_current_slide')}, action={edit.get('action')!r}, "
+                f"title={edit.get('title', '')!r}, bullets={len(edit.get('bullets', []))}."
+            )
             state["applied"] = sequence
             moved = apply_edit(edit, stream, state["mark"])
             if moved != state["mark"]:
-                state["mark"] = moved
+                state["mark"] = state["seen"] = moved
                 state["generation"] += 1
                 state["last_text"] = ""
 
@@ -1465,6 +1689,10 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
             spoken = stream.text_since(mark)
             if len(spoken.split()) < MIN_WORDS_TO_EDIT:
                 continue
+            # Everything heard since the last decision. Only this loop touches
+            # ``seen``, and only this loop runs here, so no lock is needed.
+            recent = stream.text_since(state["seen"]) or spoken
+            state["seen"] = stream.mark()
             with state_lock:
                 # Re-asking the same question invites a different answer, and a
                 # different answer with no new speech behind it is an invention.
@@ -1474,7 +1702,11 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
                 state["issued"] += 1
                 state["in_flight"] += 1
                 sequence = state["issued"]
-            pool.submit(run_edit, sequence, generation, build_payload(spoken))
+                trace(
+                    f"QUEUE EDITOR #{sequence} (generation {generation}): "
+                    f"{len(spoken.split())} words since the current slide began."
+                )
+            pool.submit(run_edit, sequence, generation, build_payload(spoken, recent))
 
     threading.Thread(target=stream.read_events, daemon=True, name="transcript").start()
     if args.commands_port:

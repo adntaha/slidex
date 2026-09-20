@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Slidex</title>
+<title>SlideX</title>
 <style>
 /* The frame is the sizing context for everything on a slide, so type and
    spacing stay proportional to the slide instead of to the browser window. */
@@ -18,10 +18,24 @@ h1{color:#5f6368;font-size:.78rem;letter-spacing:.08em}
 main{container-type:size;container-name:frame;width:min(100%,1240px);aspect-ratio:16/9;position:relative;background:#fff;box-shadow:0 3px 15px #2021242b;overflow:hidden}
 .empty{width:100%;height:100%;display:grid;place-items:center;color:#5f6368;font-size:clamp(1.2rem,3cqw,2.2rem)}
 
-/* Slides stack inside the frame; only the active one is visible. */
-.slide{position:absolute;inset:0;padding:clamp(18px,4.6cqw,74px);display:grid;grid-template-columns:minmax(0,1fr);align-content:center;gap:clamp(14px,2.6cqw,40px);opacity:0;pointer-events:none;transform:translateX(5%);transition:opacity 260ms ease,transform 360ms cubic-bezier(.2,.8,.2,1)}
+/* Slides stack inside the frame; only the active one is visible. Moving between
+   them is a transition rather than a cut, so the audience sees that the deck
+   advanced instead of seeing the content swap in place. */
+.slide{position:absolute;inset:0;padding:clamp(18px,4.6cqw,74px);display:grid;grid-template-columns:minmax(0,1fr);align-content:center;gap:clamp(14px,2.6cqw,40px);opacity:0;pointer-events:none;transform:translateX(5%);transition:opacity 260ms ease,transform 300ms cubic-bezier(.16,1,.3,1)}
 .slide.is-active{opacity:1;pointer-events:auto;transform:translateX(0)}
 .slide.is-new.is-active{animation:slide-in 480ms cubic-bezier(.16,1,.3,1)}
+
+/* Edits to a slide already on screen must draw the eye to the words that
+   changed and nowhere else. Re-animating the whole slide because one bullet
+   moved hides the very change the audience is meant to notice. */
+@keyframes bullet-in{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+@keyframes text-changed{from{background:#d2e3fc}to{background:transparent}}
+li.is-added{animation:bullet-in 340ms cubic-bezier(.16,1,.3,1)}
+li.is-changed,h2.is-changed{animation:text-changed 1200ms ease-out;border-radius:4px}
+/* No 'to' on purpose: it defaults to the element's own opacity, so a background
+   image fades up to its washed-out .24 instead of flashing to full and dropping. */
+.slide-image{animation:image-in 420ms ease-out}
+@keyframes image-in{from{opacity:0}}
 
 /* fitContent() shrinks this block about its left edge when the text is too tall. */
 .slide-content{position:relative;z-index:1;min-width:0;transform-origin:left center}
@@ -78,7 +92,7 @@ button:disabled{color:#bdc1c6;cursor:default}
 </style>
 </head>
 <body>
-<header><h1>Slidex</h1><p id="status">CONNECTING</p></header>
+<header><h1>SlideX</h1><p id="status">CONNECTING</p></header>
 <div id="stage"><main id="slides"><div class="empty">Listening for a topic...</div></main></div>
 <nav id="controls" aria-label="Presentation controls">
   <button id="previous" aria-label="Previous slide">‹</button>
@@ -97,6 +111,7 @@ let activeIndex = 0;
 const shown = new Set(); // slide ids this page has drawn at least once
 let latestDeckVersion = 0;
 let followedSlideId = null;
+let deckActiveId = null; // the slide the recorder is writing to right now
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -109,9 +124,19 @@ function select(index) {
   const cards = [...slides.querySelectorAll(".slide")];
   activeIndex = Math.max(0, Math.min(index, cards.length - 1));
   cards.forEach((card, i) => card.classList.toggle("is-active", i === activeIndex));
+  const selected = cards[activeIndex];
+  if (selected?.classList.contains("is-new")) {
+    // Do not let DOM updates restart a creation animation. Its class is only
+    // retained for the one initial entrance.
+    setTimeout(() => selected.classList.remove("is-new"), 500);
+  }
+  syncRecording();
   counter.textContent = cards.length ? `${activeIndex + 1} / ${cards.length}` : "— / —";
   previousButton.disabled = activeIndex === 0;
-  nextButton.disabled = !cards.length || activeIndex === cards.length - 1;
+  // Next is never a dead end: at the last slide it starts the next one. Greying
+  // it out there removed the only pointer-driven way to add a slide, because a
+  // new slide always leaves the viewer on the last one.
+  nextButton.disabled = !cards.length;
 }
 
 // Commons occasionally serves a URL that will not load. Remember those and let
@@ -143,14 +168,30 @@ function paintImage(card, image) {
   card.classList.add("has-image", `image-${image.placement}`);
 }
 
-function paintBullets(list, bullets) {
+// Run a one-shot highlight, restarting it if the same node changes twice in a
+// row. Reading offsetWidth between the two class changes is what makes the
+// browser treat this as a new animation rather than a continuing one.
+function flash(node, className) {
+  node.classList.remove(className);
+  void node.offsetWidth;
+  node.classList.add(className);
+  node.addEventListener("animationend", () => node.classList.remove(className), { once: true });
+}
+
+// `highlight` is off for a card being drawn for the first time: the slide is
+// already animating in as a whole, and marking up every bullet inside it would
+// say "all of this is new" when nothing here has changed yet.
+function paintBullets(list, bullets, highlight) {
   const items = [...list.children];
   bullets.forEach((bullet, rank) => {
     const item = items[rank];
     if (!item) {
-      list.append(element("li", "", bullet));
+      const added = element("li", "", bullet);
+      list.append(added);
+      if (highlight) flash(added, "is-added");
     } else if (item.textContent !== bullet) {
       item.textContent = bullet;
+      if (highlight) flash(item, "is-changed");
     }
   });
   items.slice(bullets.length).forEach(item => item.remove());
@@ -190,9 +231,15 @@ function newCard(key) {
 }
 
 function render(deck) {
-  const fingerprint = JSON.stringify(deck.slides);
+  // The destination belongs in the fingerprint. Leaving it out lets a poll that
+  // only moves the selection compare equal to the last one and return early,
+  // which is the deck refusing to advance to a slide it has already drawn.
+  const fingerprint = JSON.stringify([deck.active_slide_id, deck.slides]);
   if (fingerprint === previous) return;
   previous = fingerprint;
+  // Recorded before any select() below, because that is what decides whether the
+  // viewer is still watching the slide being written.
+  deckActiveId = deck.active_slide_id ?? null;
 
   if (!deck.slides.length) {
     if (!slides.querySelector(".empty")) slides.replaceChildren(element("div", "empty", "Listening for a topic..."));
@@ -201,56 +248,128 @@ function render(deck) {
   }
   slides.querySelector(".empty")?.remove();
 
-  const existing = new Map([...slides.querySelectorAll(".slide")].map(card => [card.dataset.slide, card]));
-  // A slide id the page has never drawn is one the speaker just created. Its
-  // position can be anywhere, because the title slide is inserted at the front.
-  let created = -1;
+  const drawn = [...slides.querySelectorAll(".slide")];
+  // Which slide the viewer is on, read before the rebuild reorders anything.
+  // Positions shift when the title slide is inserted at the front, so holding
+  // the index across a render would quietly move the viewer one slide back.
+  const heldId = drawn[activeIndex]?.dataset.slide ?? null;
+  const existing = new Map(drawn.map(card => [card.dataset.slide, card]));
+  // Drop deleted slides first so the surviving cards already sit at the indices
+  // the loop below compares against.
+  const wanted = new Set(deck.slides.map(slide => String(slide.id)));
+  existing.forEach((card, key) => {
+    if (!wanted.has(key)) {
+      card.remove();
+      existing.delete(key);
+    }
+  });
+  // A slide id the page has never drawn is one that was just created, and that
+  // holds however it was created. Ids only ever increase, so the largest unseen
+  // id is the newest slide -- which is not the last position, because the title
+  // slide is inserted at the front.
+  let createdIndex = -1;
+  let createdId = -Infinity;
   deck.slides.forEach((slide, index) => {
     const key = String(slide.id);
+    const fresh = !shown.has(key);
     const card = existing.get(key) ?? newCard(key);
-    existing.delete(key);
-    if (!shown.has(key)) {
+    if (fresh) {
       shown.add(key);
-      created = index;
+      if (Number(slide.id) > createdId) {
+        createdId = Number(slide.id);
+        createdIndex = index;
+      }
     }
     card.classList.toggle("title-slide", slide.kind === "title");
-    card.querySelector(".slide-number").textContent = `SLIDE ${String(slide.number).padStart(2, "0")}`;
+    const label = `SLIDE ${String(slide.number).padStart(2, "0")}`;
+    const number = card.querySelector(".slide-number");
+    if (number.textContent !== label) number.textContent = label;
     const title = card.querySelector("h2");
-    title.textContent = slide.title;
-    paintBullets(card.querySelector("ul"), slide.bullets);
+    if (title.textContent !== slide.title) {
+      title.textContent = slide.title;
+      if (!fresh) flash(title, "is-changed");
+    }
+    paintBullets(card.querySelector("ul"), slide.bullets, !fresh);
     paintImage(card, slide.image);
-    slides.append(card); // re-appending keeps DOM order in step with deck order
+    // Re-inserting a node that is already in place still removes and reinserts
+    // it, which restarts every animation running inside it. Only move a card
+    // that is genuinely out of order.
+    if (slides.children[index] !== card) slides.insertBefore(card, slides.children[index] ?? null);
   });
-  existing.forEach(card => card.remove());
   fitAll();
-  // The backend is authoritative about the current newly created content
-  // slide. Existing-slide updates preserve a viewer's manual selection.
+  // Where the deck puts the viewer, in order of authority:
+  //   1. a slide that has just appeared. Seeing it for the first time is the
+  //      evidence something was created, so this works for every path that
+  //      makes a slide -- including one that forgets to move active_slide_id.
+  //   2. active_slide_id, when the backend has moved it since we last followed.
+  //   3. otherwise nobody created anything, so leave a manual selection alone,
+  //      holding the slide by id because an insert at the front shifts indices.
   const destination = deck.slides.findIndex(slide => String(slide.id) === String(deck.active_slide_id));
-  if (destination !== -1 && deck.active_slide_id !== followedSlideId) {
+  if (createdIndex !== -1) {
+    followedSlideId = deck.active_slide_id; // stay in step so rule 2 cannot bounce us
+    select(createdIndex);
+  } else if (destination !== -1 && String(deck.active_slide_id) !== String(followedSlideId)) {
     followedSlideId = deck.active_slide_id;
     select(destination);
   } else {
-    select(activeIndex);
+    const held = deck.slides.findIndex(slide => String(slide.id) === heldId);
+    select(held === -1 ? activeIndex : held);
   }
 }
 
-function pauseRecording() {
-  fetch("/api/command", { method: "POST", body: "CMD_PAUSE" }).catch(() => {});
+function sendCommand(name) {
+  return fetch("/api/command", { method: "POST", body: name });
 }
 
-previousButton.addEventListener("click", () => {
-  if (activeIndex > 0) pauseRecording();
-  select(activeIndex - 1);
-});
-nextButton.addEventListener("click", () => select(activeIndex + 1));
+// Browsing back stops the deck being written underneath you, and returning to
+// the live slide starts it again. Only a pause this page asked for is lifted
+// here: if the speaker paused from the hardware button, that stands.
+let viewerHeldPause = false;
+function syncRecording() {
+  if (deckActiveId === null || !slides.querySelector(".slide")) return;
+  const cards = [...slides.querySelectorAll(".slide")];
+  const onLiveSlide = cards[activeIndex]?.dataset.slide === String(deckActiveId);
+  if (!onLiveSlide && !viewerHeldPause) {
+    viewerHeldPause = true;
+    sendCommand("CMD_PAUSE_ON").catch(() => { viewerHeldPause = false; });
+  } else if (onLiveSlide && viewerHeldPause) {
+    viewerHeldPause = false;
+    sendCommand("CMD_PAUSE_OFF").catch(() => {});
+  }
+}
+
+async function createNextSlide() {
+  try {
+    const response = await sendCommand("CMD_NEXT");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const deck = await response.json();
+    render(deck); // active_slide_id immediately selects the blank destination
+    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
+  } catch (_) {
+    // A hosted, view-only display has no recorder to control.
+  }
+}
+
+// Walk forward through the slides that exist; at the end of the deck, start the
+// one the speaker is about to talk to.
+function advance() {
+  if (activeIndex < slides.querySelectorAll(".slide").length - 1) {
+    select(activeIndex + 1);
+    return;
+  }
+  createNextSlide();
+}
+
+// select() decides whether to pause, so navigation no longer says so itself.
+previousButton.addEventListener("click", () => select(activeIndex - 1));
+nextButton.addEventListener("click", advance);
 document.addEventListener("keydown", event => {
   if (["ArrowLeft", "ArrowUp"].includes(event.key)) {
-    if (activeIndex > 0) pauseRecording();
     select(activeIndex - 1);
   }
   if (["ArrowRight", "ArrowDown", " "].includes(event.key)) {
     event.preventDefault();
-    select(activeIndex + 1);
+    advance();
   }
 });
 
