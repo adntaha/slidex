@@ -28,7 +28,11 @@ libportaudio2` on Debian/Ubuntu).
 | `--web` | | Serve the deck UI on localhost. |
 | `--web-port N` | `8000` | Port for `--web`. |
 | `--push URL` | | Mirror the deck to a hosted display. Needs `SLIDEX_PUSH_TOKEN`. |
-| `--chunk-seconds S` | `0.5` | Seconds of audio committed before each deck decision. |
+| `--transcribe` | | Transcribe continuously and revise slides on a timer (see below). |
+| `--editor-seconds S` | `1.0` | With `--transcribe`, how often the current slide is revised. |
+| `--editor-model M` | `gpt-4.1-mini` | With `--transcribe`, the model that writes slides. |
+| `--vad` | | With `--transcribe`, let the server segment turns instead of committing on a timer. |
+| `--chunk-seconds S` | `2.0` | Ceiling on audio per deck decision; a pause commits sooner. Set `0.5` for the old fixed-tick behaviour. |
 | `PROMPT` | | Instead of `--microphone`, run a single text turn through the same tools. |
 
 ## Deploying the display to Vercel
@@ -85,6 +89,34 @@ build because it exports no `app` or `handler`. `.vercelignore` keeps it and the
 Pipfile out of the deployment anyway — the Pipfile pins `sounddevice`, which
 needs the PortAudio system headers and cannot compile in the serverless image.
 The `api/` routes are standard library only.
+
+## Two ways of building the deck
+
+The default asks the speech-to-speech model to edit the deck while it is still
+listening. That is responsive, but a slow decision stops the ear, and a quiet
+moment still demands an answer -- which is how invented bullets appear.
+
+`--transcribe` splits the two. A transcription session only ever produces text;
+a separate editor reads the transcript on its own clock and rewrites the current
+slide. Nothing the editor does can starve the microphone, silence produces no
+transcript and therefore no decision, and because each pass re-reads the
+transcript the slide corrects itself instead of accumulating mistakes.
+
+```bash
+pipenv run python slidex.py --transcribe --web
+```
+
+Only the slide being written is mutable; finished slides are frozen, so the deck
+does not churn behind the speaker.
+
+Editor calls overlap, so one slow request cannot stall the deck. Because answers
+can then arrive out of order, each carries the revision it was written against:
+one that a newer answer has already superseded is dropped, as is one written
+against a slide that has since been closed. Measured round trip is about a
+second (`gpt-4.1-mini` 1.02s, `gpt-4.1-nano` 0.78s, `gpt-4o-mini` 1.03s), so a
+one second tick keeps roughly one edit in flight. Raise `--editor-seconds` to
+cut cost; the editor already skips a tick when nothing new has been said. `tools/transcribe_probe.py` prints the raw
+transcript stream if you want to check transcription quality on its own.
 
 ## How it fits together
 

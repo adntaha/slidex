@@ -11,9 +11,14 @@ Set OPENAI_API_KEY, then run:
 from __future__ import annotations
 
 import argparse
+import array
 import base64
+import collections
+import contextlib
 import json
 import os
+import platform
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +35,15 @@ MODEL = "gpt-realtime-2.1"
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
 
+# Trace lines carry bullets and arrows. A legacy Windows console in cp1252 or
+# cp437 raises UnicodeEncodeError on those rather than printing them, which would
+# take the program down over a log line.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except (AttributeError, OSError):  # pragma: no cover - not every stream supports it
+    pass
+
+
 def trace(message: str) -> None:
     """Emit progress immediately; useful when running a silent-text session."""
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
@@ -37,6 +51,25 @@ def trace(message: str) -> None:
 
 MAX_BULLETS_PER_SLIDE = 5
 AUDIO_RATE = 24000  # Hz, 16-bit mono PCM
+# A deck decision made mid-sentence is a decision made on half a thought, so a
+# pause commits early. Semantic boundaries would be better than peak amplitude,
+# but a speaker who never pauses must not be left with one slide at the end --
+# hence the pause is only ever an *earlier* trigger than --chunk-seconds.
+SILENCE_PEAK = 900  # int16 amplitude below which a block counts as silence
+SILENCE_HOLD_SECONDS = 0.35  # a pause this long ends an utterance
+MIN_UTTERANCE_SECONDS = 1.0  # never commit a sliver just because it opened quietly
+MIN_WORDS_TO_EDIT = 4  # below this the transcript is not worth a deck decision
+MIN_SPEECH_SECONDS = 0.3  # a window holding less speech than this is not a decision
+PRE_ROLL_BLOCKS = 3  # ~300 ms of lead-in kept back so a word onset is not clipped
+
+# The sounddevice wheels bundle PortAudio on Windows and macOS; only Linux needs
+# the system package.
+PORTAUDIO_HINT = (
+    "Microphone streaming needs the PortAudio runtime. On Ubuntu/Debian run: "
+    "sudo apt-get install libportaudio2"
+    if platform.system() == "Linux"
+    else "Microphone streaming could not load PortAudio. Reinstall dependencies: pipenv install"
+)
 # A decision normally takes a second or two. These bound what happens when one
 # does not: audio stops piling up, and a wedged turn eventually releases.
 MAX_BUFFERED_AUDIO_SECONDS = 8.0
@@ -71,20 +104,32 @@ def current_content_slide() -> dict[str, Any] | None:
 
 
 def slide_state() -> dict[str, Any]:
-    """Return enough state for the model to choose its next deck-editing action."""
+    """Return enough state for the model to choose its next deck-editing action.
+
+    ``deck`` lists every slide so the model can tell that the speaker has come
+    back to an earlier subject instead of forcing the point into whatever slide
+    happens to be last. Only titles and counts appear there: every tool result
+    carries this payload and the Realtime conversation keeps all of them, so
+    repeating every bullet of every slide would grow the context quadratically.
+    Full bullets accompany the one slide that can still be edited.
+    """
     with DECK_LOCK:
         slide = current_content_slide()
-        has_title_slide = any(item.get("kind") == "title" for item in SLIDES)
-        if slide is None:
-            return {
-                "slide_count": len(SLIDES),
-                "has_title_slide": has_title_slide,
-                "current_slide": None,
-            }
         return {
             "slide_count": len(SLIDES),
-            "has_title_slide": has_title_slide,
-            "current_slide": {
+            "has_title_slide": any(item["kind"] == "title" for item in SLIDES),
+            "deck": [
+                {
+                    "number": index,
+                    "kind": item["kind"],
+                    "title": item["title"],
+                    "bullet_count": len(item["bullets"]),
+                }
+                for index, item in enumerate(SLIDES, start=1)
+            ],
+            "current_slide": None
+            if slide is None
+            else {
                 "number": SLIDES.index(slide) + 1,
                 "title": slide["title"],
                 "bullets": list(slide["bullets"]),
@@ -491,38 +536,28 @@ class RealtimeToolClient:
                         }
                     },
                     "instructions": (
-                        "You are a conservative, evidence-only real-time slide-deck editor. "
-                        "Build a coherent deck only from the main speaker's clearly heard, "
-                        "explicit ideas using tools, not visible text. Never invent, assume, "
-                        "or add a theme, fact, entity, relationship, or motivation the speaker "
-                        "did not state. Background conversations, television, ambient speech, "
-                        "noise, partial phrases, and uncertain audio are not deck content. If "
-                        "you are not highly confident the statement is from the main speaker and "
-                        "can be recorded without adding meaning, make no tool call. Do not "
-                        "reinterpret a statement through the lens of the current slide's topic. "
-                        "As soon as the opening topic is clear, first call create_title_slide with "
-                        "a concise presentation title. Then, when there is a substantive "
-                        "point, create a separate content slide with create_new_slide "
-                        "before adding bullets. Do not make the title slide from a greeting, "
-                        "filler, or an unclear fragment. Call create_title_slide exactly "
-                        "once per deck: after its tool result reports has_title_slide true, "
-                        "never call it again unless the deck has been reset. Add a concise, "
-                        "standalone bullet only for substantive, sufficiently complete "
-                        "ideas. Do not add bullets for filler, false starts, or "
-                        "repetition. When later speech corrects or meaningfully refines "
-                        "a current-slide bullet, use update_bullet_point instead of "
-                        "adding a duplicate. When one coherent topic is finished and "
-                        "the speaker begins a genuinely new topic, call "
-                        "create_new_slide with a short title before adding that topic's "
-                        "bullets. Treat a clear, explicitly stated change of subject, entity, timeframe, or "
-                        "question as a new topic; do not force it into the current slide or "
-                        "rewrite a current bullet merely because it was the latest one. "
-                        "Keep content slides to five bullets maximum. If the "
-                        "same topic needs another point after five bullets, start a new "
-                        "slide titled with the previous title plus ' (continued)'. Do not "
-                        "make a new slide merely because of a pause. "
-                        "Slides are illustrated automatically; there is no image tool to call. "
-                        "Prefer tool calls over text responses."
+                        "You are a conservative, evidence-only real-time slide-deck editor. Build a coherent deck"
+                        " only from the main speaker's clearly heard, explicit ideas using tools, not visible "
+                        "text. Never invent, assume, or add a theme, fact, entity, relationship, or motivation "
+                        "the speaker did not state. Background conversations, television, ambient speech, noise, "
+                        "partial phrases, and uncertain audio are not deck content. If you are not highly "
+                        "confident the statement is from the main speaker and can be recorded without adding "
+                        "meaning, make no tool call. Do not reinterpret a statement through the lens of the "
+                        "current slide's topic. As soon as the opening topic is clear, first call "
+                        "create_title_slide with a concise presentation title. Then, when there is a substantive "
+                        "point, create a separate content slide with create_new_slide before adding bullets. Do "
+                        "not make the title slide from a greeting, filler, or an unclear fragment. Add a concise,"
+                        " standalone bullet only for substantive, sufficiently complete ideas. Do not add bullets"
+                        " for filler, false starts, or repetition. When later speech corrects or meaningfully "
+                        "refines a current-slide bullet, use update_bullet_point instead of adding a duplicate. "
+                        "When one coherent topic is finished and the speaker begins a genuinely new topic, call "
+                        "create_new_slide with a short title before adding that topic's bullets. Treat a clear, "
+                        "explicitly stated change of subject, entity, timeframe, or question as a new topic; do "
+                        "not force it into the current slide or rewrite a current bullet merely because it was "
+                        "the latest one. Every tool result lists the whole deck: check it before assuming the "
+                        "speaker is still on the current slide's subject. Do not make a new slide merely because of a pause. Use tools rather "
+                        "than prose, but making no call at all is the correct and expected answer whenever "
+                        "nothing new was clearly said."
                     ),
                     "tools": TOOLS,
                     "tool_choice": "auto",
@@ -652,52 +687,87 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
     except ImportError as exc:
         raise SystemExit("Install Python dependencies first: pipenv install") from exc
     except OSError as exc:
-        raise SystemExit(
-            "Microphone streaming requires the system PortAudio runtime. "
-            "On Ubuntu/Debian run: sudo apt-get install libportaudio2"
-        ) from exc
+        raise SystemExit(PORTAUDIO_HINT) from exc
 
     stop_commits = threading.Event()
+    boundary = threading.Event()
     buffered_bytes = 0
+    speech_bytes = 0
+    silent_seconds = 0.0
     dropping = False
     buffer_lock = threading.Lock()
+    pre_roll: collections.deque[bytes] = collections.deque(maxlen=PRE_ROLL_BLOCKS)
     max_buffered_bytes = int(MAX_BUFFERED_AUDIO_SECONDS * AUDIO_RATE * 2)
+    min_utterance_bytes = int(MIN_UTTERANCE_SECONDS * AUDIO_RATE * 2)
 
     def on_audio(indata: Any, frames: int, time_info: Any, status: Any) -> None:
-        nonlocal buffered_bytes, dropping
+        """Buffer speech only.
+
+        Silence must never reach the model. Committing a window of it asks what
+        should change about the deck when nothing was said, and the model
+        answers by inventing a plausible next bullet.
+        """
+        nonlocal buffered_bytes, speech_bytes, dropping, silent_seconds
         if status:
             trace(f"Microphone status: {status}")
         raw_audio = bytes(indata)
+        samples = array.array("h", raw_audio)
+        speaking = bool(samples) and max(abs(min(samples)), abs(max(samples))) >= SILENCE_PEAK
+
         with buffer_lock:
-            # Once a decision is slow, buffering everything said meanwhile only
-            # produces one huge catch-up turn. Cap it and drop the excess.
-            if buffered_bytes + len(raw_audio) > max_buffered_bytes:
-                if not dropping:
-                    dropping = True
-                    trace(f"Buffer full at {MAX_BUFFERED_AUDIO_SECONDS:g}s; dropping audio until the deck catches up.")
+            silent_seconds = 0.0 if speaking else silent_seconds + len(samples) / AUDIO_RATE
+            if not speaking and speech_bytes >= min_utterance_bytes and silent_seconds >= SILENCE_HOLD_SECONDS:
+                boundary.set()
+
+            if speaking:
+                # Once a decision is slow, buffering everything said meanwhile
+                # only produces one huge catch-up turn. Cap it, drop the excess.
+                if buffered_bytes + len(raw_audio) > max_buffered_bytes:
+                    if not dropping:
+                        dropping = True
+                        trace(f"Buffer full at {MAX_BUFFERED_AUDIO_SECONDS:g}s; dropping audio until the deck catches up.")
+                    return
+                blocks = [*pre_roll, raw_audio] if speech_bytes == 0 else [raw_audio]
+                pre_roll.clear()
+                speech_bytes += len(raw_audio)
+            elif speech_bytes and silent_seconds <= SILENCE_HOLD_SECONDS:
+                blocks = [raw_audio]  # a breath inside a phrase is part of the phrase
+            else:
+                pre_roll.append(raw_audio)  # keep a little lead-in, send nothing
                 return
-            buffered_bytes += len(raw_audio)
-        client.send(
-            {
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(raw_audio).decode("ascii"),
-            }
-        )
+            buffered_bytes += sum(len(block) for block in blocks)
+
+        for block in blocks:
+            client.send(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(block).decode("ascii"),
+                }
+            )
 
     def commit_audio_chunks() -> None:
-        nonlocal buffered_bytes, dropping
-        while not stop_commits.wait(chunk_seconds):
+        nonlocal buffered_bytes, speech_bytes, dropping, silent_seconds
+        while not stop_commits.is_set():
+            # Whichever comes first: the speaker drew breath, or --chunk-seconds.
+            paused = boundary.wait(chunk_seconds)
+            boundary.clear()
+            if stop_commits.is_set():
+                break
             client.release_stalled_turn()
             with buffer_lock:
-                pending = buffered_bytes
-            if not pending:
-                continue
-            if not client.response_idle.is_set():
+                pending, speech = buffered_bytes, speech_bytes
+            # No speech means no decision to make. Asking anyway is exactly what
+            # makes the model invent bullets while the speaker is simply quiet.
+            if speech < MIN_SPEECH_SECONDS * AUDIO_RATE * 2 or not client.response_idle.is_set():
                 continue
             with buffer_lock:
-                buffered_bytes = 0
+                buffered_bytes = speech_bytes = 0
+                silent_seconds = 0.0
                 dropping = False
-            trace(f"Committing {pending / (AUDIO_RATE * 2):.1f}s of audio for a deck decision.")
+            trace(
+                f"Committing {pending / (AUDIO_RATE * 2):.1f}s of audio "
+                f"({'pause' if paused else 'max wait'})."
+            )
             client.begin_manual_audio_turn()
 
     client.configure(manual_audio_turns=True)
@@ -710,14 +780,522 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
         callback=on_audio,
     ):
         trace(
-            f"Microphone is live. A deck decision runs every {chunk_seconds:g} seconds; "
+            f"Microphone is live. A deck decision runs at each pause, and at least every "
+            f"{chunk_seconds:g} seconds; "
             "assistant text remains hidden. Press Ctrl-C to stop."
         )
         threading.Thread(target=commit_audio_chunks, daemon=True, name="audio-commit-loop").start()
+        # The event loop runs off the main thread so Ctrl-C lands during a sleep
+        # rather than inside a blocking socket read, which Windows will not
+        # interrupt. Failures are carried back rather than lost with the thread.
+        failure: list[BaseException] = []
+
+        def listen() -> None:
+            try:
+                client.listen_forever(manual_audio_turns=True)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+                failure.append(exc)
+
+        listener = threading.Thread(target=listen, daemon=True, name="realtime-events")
+        listener.start()
         try:
-            client.listen_forever(manual_audio_turns=True)
+            while listener.is_alive():
+                time.sleep(0.25)
         finally:
             stop_commits.set()
+        if failure:
+            raise failure[0]
+
+
+# --------------------------------------------------------------------------
+# Transcribe-then-derive mode
+#
+# The speech-to-speech model has to decide what to do with the deck while it is
+# still listening, so a slow decision stops the ear and a quiet moment still
+# demands an answer. Splitting the two removes both: a transcription session
+# only ever produces text, and a separate editor reads that text on its own
+# clock. Nothing the editor does can starve the microphone.
+# --------------------------------------------------------------------------
+
+TRANSCRIBE_URL = f"{REALTIME_URL}?intent=transcription"
+TRANSCRIBE_MODEL = "gpt-live-transcribe"
+# Measured against the API: the newest transcription models stream text as you
+# speak but reject turn_detection outright, while the ones that accept it only
+# emit text once a turn closes. You get live text or clean sentence boundaries,
+# not both.
+VAD_CAPABLE_MODELS = ("gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1")
+TRANSCRIBE_COMMIT_SECONDS = 8.0
+EDITOR_MODEL = "gpt-4.1-mini"
+EDITOR_URL = "https://api.openai.com/v1/chat/completions"
+EDITOR_TIMEOUT = 25
+EDITOR_WORKERS = 3  # editor calls overlap; see the staleness guards in run_transcription_mode
+EDITOR_MAX_TOKENS = 400
+DETAILED_SLIDES_IN_PAYLOAD = 2  # older slides contribute titles only, so the prompt stays flat
+
+EDITOR_SYSTEM = (
+    "You maintain one slide of a live deck being built from a talk as it happens. "
+    "You are given the titles of earlier slides, the last few finished slides in full, "
+    "the slide currently being written, and the transcript of everything said since "
+    "that slide started. "
+    "Rewrite the current slide so it reflects that transcript. Record only what the "
+    "speaker actually said: never add a fact, entity, or theme that is not in the "
+    "transcript. Ignore filler, false starts, repetition, and anything that reads "
+    "like background conversation. "
+    "Keep bullets short and standalone, and keep wording stable between calls -- "
+    "you are shown your own previous output, and rewording it for no reason makes "
+    "the deck flicker for the audience. "
+    f"Never exceed {MAX_BULLETS_PER_SLIDE} bullets. "
+    "Reply with one JSON object choosing an action: "
+    "'none' when the transcript adds nothing worth showing; "
+    "'title' for the deck's opening title slide, once, when the subject first becomes clear; "
+    "'update' to rewrite the current slide; "
+    "'new' when the speaker has clearly moved to a different subject, in which case "
+    "the finished slide is frozen and your title and bullets begin the next one."
+)
+
+EDITOR_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "slide_edit",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["none", "title", "update", "new"]},
+                "title": {"type": "string"},
+                "bullets": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["action", "title", "bullets"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+class TranscriptStream:
+    """A live transcript from a Realtime transcription session.
+
+    Deltas and completions are both handled because the cadence is not
+    guaranteed: the model may stream text as it arrives, or only emit a final
+    transcript when a turn closes. Deltas accumulate per item and the matching
+    completion replaces them, so neither is double counted and the transcript is
+    correct whichever the server actually sends. Manual commits give the editor a
+    floor on freshness even if no delta ever arrives.
+    """
+
+    def __init__(self, api_key: str, model: str = TRANSCRIBE_MODEL, use_vad: bool = False) -> None:
+        trace(f"Connecting to Realtime transcription ({model})...")
+        self.socket = websocket.create_connection(
+            TRANSCRIBE_URL, header=[f"Authorization: Bearer {api_key}"], timeout=20
+        )
+        self.socket.settimeout(None)
+        self.use_vad = use_vad
+        self._send_lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.settled: list[str] = []
+        self.pending: dict[str, str] = {}
+        self.stop = threading.Event()
+        self.send(
+            {
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": AUDIO_RATE},
+                            "transcription": {"model": model},
+                            "turn_detection": {"type": "server_vad"} if use_vad else None,
+                        }
+                    },
+                },
+            }
+        )
+        trace("Transcription session open.")
+
+    def send(self, event: dict[str, Any]) -> None:
+        with self._send_lock:
+            self.socket.send(json.dumps(event))
+
+    def mark(self) -> int:
+        """A position in the transcript to measure a slide's span from."""
+        with self._lock:
+            return len(self.settled)
+
+    def text_since(self, mark: int) -> str:
+        with self._lock:
+            parts = [*self.settled[mark:], *self.pending.values()]
+        return " ".join(part.strip() for part in parts if part.strip())
+
+    def read_events(self) -> None:
+        while not self.stop.is_set():
+            try:
+                event = json.loads(self.socket.recv())
+            except Exception:  # noqa: BLE001 - a closed socket simply ends the stream
+                return
+            kind = event.get("type", "")
+            if kind.endswith("input_audio_transcription.delta"):
+                with self._lock:
+                    item = event.get("item_id", "")
+                    self.pending[item] = self.pending.get(item, "") + event.get("delta", "")
+            elif kind.endswith("input_audio_transcription.completed"):
+                text = (event.get("transcript") or "").strip()
+                with self._lock:
+                    self.pending.pop(event.get("item_id", ""), None)
+                    if text:
+                        self.settled.append(text)
+                        trace(f"HEARD: {text}")
+            elif kind.endswith("input_audio_transcription.failed"):
+                trace(f"Transcription failed: {json.dumps(event.get('error', event))[:160]}")
+            elif kind == "error":
+                trace(f"Transcription error: {json.dumps(event.get('error', event))[:160]}")
+
+    def close(self) -> None:
+        self.stop.set()
+        self.socket.close()
+
+
+def edit_deck(api_key: str, model: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Ask the editor what the current slide should now say. Blocking; own thread."""
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": EDITOR_SYSTEM},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            "response_format": EDITOR_SCHEMA,
+            "max_completion_tokens": EDITOR_MAX_TOKENS,
+        }
+    ).encode()
+    request = Request(
+        EDITOR_URL,
+        data=body,
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=EDITOR_TIMEOUT) as response:  # noqa: S310 - fixed OpenAI endpoint
+            reply = json.load(response)
+        return json.loads(reply["choices"][0]["message"]["content"])
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        trace(f"EDITOR FAILED: {exc}")
+        return None
+
+
+def apply_edit(edit: dict[str, Any], stream: TranscriptStream, mark: int) -> int:
+    """Fold one editor decision into the deck; return the new transcript mark."""
+    action = edit.get("action", "none")
+    title = (edit.get("title") or "").strip()
+    bullets = [b.strip() for b in edit.get("bullets", []) if b and b.strip()][:MAX_BULLETS_PER_SLIDE]
+
+    if action == "none" or (action != "none" and not title):
+        return mark
+    with DECK_LOCK:
+        if action == "title":
+            create_title_slide(title)
+            return mark
+        if action == "new":
+            slide = append_content_slide(title)
+            slide["bullets"] = bullets
+            if bullets and not slide.get("image_requested"):
+                slide["image_requested"] = True
+                IMAGE_WORKERS.submit(load_slide_image, slide, f"{title} {bullets[0]}")
+            trace(f"SLIDE #{len(SLIDES)} '{title}' with {len(bullets)} bullet(s)")
+            # A new slide means the previous one is finished: measure the next
+            # slide's span from here rather than replaying the whole talk.
+            return stream.mark()
+        slide = current_content_slide()
+        if slide is None:
+            slide = append_content_slide(title)
+        if (slide["title"], slide["bullets"]) != (title, bullets):
+            slide["title"] = title
+            slide["bullets"] = bullets
+            if bullets and not slide.get("image_requested"):
+                slide["image_requested"] = True
+                IMAGE_WORKERS.submit(load_slide_image, slide, f"{title} {bullets[0]}")
+            trace(f"SLIDE #{SLIDES.index(slide) + 1} '{title}' now has {len(bullets)} bullet(s)")
+    return mark
+
+
+# --------------------------------------------------------------------------
+# Audio input
+#
+# Two sources, one shape: both hand raw 24 kHz mono PCM to a deliver() callback.
+# The ESP32 arrives over a Bluetooth serial link in the frame format defined by
+# parse_audio.py, which is imported rather than restated so the protocol has
+# exactly one definition.
+# --------------------------------------------------------------------------
+
+ESP32_RATE = 16000  # measured off the device with tools/esp32_probe.py, not assumed
+ESP32_BAUD = 115200
+# The session only accepts 24 kHz -- 16, 8 and 48 kHz are all rejected -- so
+# ESP32 frames have to be stretched 3:2 on the way through.
+DELIVERY_BYTES = AUDIO_RATE // 10 * 2  # hand over ~100 ms at a time, like a sound card
+
+
+class Resampler:
+    """Linear resampler that keeps its phase between calls.
+
+    Each ESP32 frame is only 16 ms long, so resampling them independently would
+    restart the interpolation 62 times a second and put a click at every frame
+    boundary. Carrying the sub-sample position and the previous frame's last
+    sample makes the blocks join into one continuous signal.
+    """
+
+    def __init__(self, source_rate: int, target_rate: int) -> None:
+        self.step = source_rate / target_rate
+        self.position = 0.0
+        self.carry = 0
+
+    def __call__(self, samples: array.array) -> bytes:
+        extended = array.array("h", [self.carry])
+        extended.extend(samples)
+        out = array.array("h")
+        position = self.position
+        limit = len(extended) - 1
+        while position < limit:
+            index = int(position)
+            first = extended[index]
+            out.append(int(first + (extended[index + 1] - first) * (position - index)))
+            position += self.step
+        self.carry = extended[-1]
+        self.position = position - limit
+        return out.tobytes()
+
+
+@contextlib.contextmanager
+def esp32_audio(args: argparse.Namespace, deliver: Callable[[bytes], None],
+                on_button: Callable[[str], None], paused: threading.Event):
+    try:
+        import serial
+
+        import parse_audio
+    except ImportError as exc:
+        raise SystemExit("ESP32 input needs pyserial: pipenv install") from exc
+
+    try:
+        port = args.serial_port or parse_audio.find_port()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    trace(f"Opening the ESP32 stream on {port} ({ESP32_RATE} Hz -> {AUDIO_RATE} Hz)...")
+    try:
+        link = serial.Serial(port, args.esp32_baud, timeout=1)
+    except serial.SerialException as exc:
+        raise SystemExit(f"Could not open {port}: {exc}") from exc
+
+    stop = threading.Event()
+
+    def pump() -> None:
+        resample = Resampler(ESP32_RATE, AUDIO_RATE)
+        pending = bytearray()
+        # Seeded from the first frame, not from zero: whatever the buttons read
+        # at startup is their resting state, and treating that as a press fires
+        # a phantom command before the speaker has touched anything.
+        previous: int | None = None
+        while not stop.is_set():
+            try:
+                parse_audio.wait_for_header(link)
+                frame = parse_audio.read_exact(link, 1 + parse_audio.AUDIO_PAYLOAD_SIZE)
+            except (OSError, serial.SerialException) as exc:
+                if not stop.is_set():
+                    trace(f"ESP32 link lost: {exc}")
+                return
+            if frame is None:
+                continue  # truncated mid-frame; wait_for_header resynchronises
+
+            # Rising edges only, so a held button fires once.
+            if previous is not None:
+                for bit, command in parse_audio.BUTTONS:
+                    if frame[0] & ~previous & bit:
+                        on_button(command.decode())
+            previous = frame[0]
+
+            if paused.is_set():
+                continue
+            samples = array.array("h", frame[1:])
+            if sys.byteorder == "big":
+                samples.byteswap()
+            pending += resample(samples)
+            if len(pending) >= DELIVERY_BYTES:
+                deliver(bytes(pending))
+                pending.clear()
+
+    threading.Thread(target=pump, daemon=True, name="esp32-reader").start()
+    try:
+        yield
+    finally:
+        stop.set()
+        link.close()
+
+
+@contextlib.contextmanager
+def audio_source(args: argparse.Namespace, deliver: Callable[[bytes], None],
+                 on_button: Callable[[str], None], paused: threading.Event):
+    """Feed 24 kHz mono PCM to `deliver` from the ESP32 or the local microphone."""
+    if getattr(args, "esp32", False):
+        with esp32_audio(args, deliver, on_button, paused):
+            yield
+        return
+
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise SystemExit("Install Python dependencies first: pipenv install") from exc
+    except OSError as exc:
+        raise SystemExit(PORTAUDIO_HINT) from exc
+
+    def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+        if status:
+            trace(f"Microphone status: {status}")
+        if not paused.is_set():
+            deliver(bytes(indata))
+
+    device = getattr(args, "device", None)
+    trace(f"Opening the {AUDIO_RATE // 1000} kHz mono PCM input"
+          + (f" '{device}'..." if device is not None else " (system default)..."))
+    with sd.RawInputStream(samplerate=AUDIO_RATE, blocksize=2400, channels=1,
+                           dtype="int16", device=device, callback=callback):
+        yield
+
+
+def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
+    """Stream audio to a transcription session; edit the deck on a timer."""
+    stream = TranscriptStream(api_key, args.transcribe_model, args.vad)
+    pool = ThreadPoolExecutor(max_workers=EDITOR_WORKERS, thread_name_prefix="deck-editor")
+    # Edits overlap so one slow call cannot stall the deck, which means answers
+    # can come back out of order. ``sequence`` drops an answer a newer one has
+    # already superseded; ``generation`` drops one written against a slide that
+    # has since been closed, whose transcript span now belongs to the slide before.
+    state = {"mark": 0, "generation": 0, "applied": 0, "issued": 0, "in_flight": 0, "last_text": ""}
+    state_lock = threading.Lock()
+
+    paused = threading.Event()
+
+    def close_current_slide() -> None:
+        """Start the next slide from here, whatever the editor was mid-way through."""
+        with state_lock:
+            state["mark"] = stream.mark()
+            state["generation"] += 1
+            state["last_text"] = ""
+
+    def on_button(command: str) -> None:
+        trace(f"BUTTON {command}")
+        if command == "CMD_WIPE":
+            with DECK_LOCK:
+                SLIDES.clear()
+            close_current_slide()
+        elif command == "CMD_NEXT":
+            close_current_slide()
+        elif command == "CMD_PAUSE":
+            if paused.is_set():
+                paused.clear()
+                trace("Resumed; audio is flowing again.")
+            else:
+                paused.set()
+                trace("Paused; audio is being dropped until the next press.")
+
+    appended = threading.Event()
+
+    def deliver(raw_audio: bytes) -> None:
+        appended.set()
+        stream.send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(raw_audio).decode("ascii"),
+            }
+        )
+
+    def commit_loop() -> None:
+        # Measured: gpt-live-transcribe streams deltas roughly every 0.2s
+        # regardless of when turns close, so committing is not what keeps the
+        # editor fed. It only decides where sentences are cut -- and cutting
+        # every couple of seconds costs accuracy, because the transcriber loses
+        # the surrounding words it would otherwise use to decide what it heard.
+        # So commit rarely: often enough to bound a turn, seldom enough to let
+        # whole sentences through.
+        while not stream.stop.wait(args.commit_seconds):
+            # Committing a buffer nothing was appended to is an API error, which
+            # happens whenever the link is quiet or the speaker has paused.
+            if not appended.is_set():
+                continue
+            appended.clear()
+            stream.send({"type": "input_audio_buffer.commit"})
+
+    def build_payload(spoken: str) -> dict[str, Any]:
+        with DECK_LOCK:
+            current = current_content_slide()
+            finished = [item for item in SLIDES if item is not current]
+            detailed = finished[-DETAILED_SLIDES_IN_PAYLOAD:] if DETAILED_SLIDES_IN_PAYLOAD else []
+            earlier = finished[: len(finished) - len(detailed)]
+            return {
+                "earlier_slide_titles": [item["title"] for item in earlier],
+                "recent_slides": [
+                    {"title": item["title"], "bullets": list(item["bullets"])} for item in detailed
+                ],
+                "has_title_slide": any(item["kind"] == "title" for item in SLIDES),
+                "current_slide": None
+                if current is None
+                else {"title": current["title"], "bullets": list(current["bullets"])},
+                "transcript_since_slide_started": spoken,
+            }
+
+    def run_edit(sequence: int, generation: int, payload: dict[str, Any]) -> None:
+        try:
+            edit = edit_deck(api_key, args.editor_model, payload)
+        finally:
+            with state_lock:
+                state["in_flight"] -= 1
+        if edit is None:
+            return
+        with state_lock:
+            if sequence <= state["applied"] or generation != state["generation"]:
+                trace(f"Discarding edit #{sequence}: a newer one already landed.")
+                return
+            state["applied"] = sequence
+            moved = apply_edit(edit, stream, state["mark"])
+            if moved != state["mark"]:
+                state["mark"] = moved
+                state["generation"] += 1
+                state["last_text"] = ""
+
+    def edit_loop() -> None:
+        while not stream.stop.wait(args.editor_seconds):
+            with state_lock:
+                mark, generation = state["mark"], state["generation"]
+                if state["in_flight"] >= EDITOR_WORKERS:
+                    continue
+            spoken = stream.text_since(mark)
+            if len(spoken.split()) < MIN_WORDS_TO_EDIT:
+                continue
+            with state_lock:
+                # Re-asking the same question invites a different answer, and a
+                # different answer with no new speech behind it is an invention.
+                if spoken == state["last_text"] or generation != state["generation"]:
+                    continue
+                state["last_text"] = spoken
+                state["issued"] += 1
+                state["in_flight"] += 1
+                sequence = state["issued"]
+            pool.submit(run_edit, sequence, generation, build_payload(spoken))
+
+    threading.Thread(target=stream.read_events, daemon=True, name="transcript").start()
+    with audio_source(args, deliver, on_button, paused):
+        trace(
+            f"Audio is live. Transcribing continuously; the deck is revised every "
+            f"{args.editor_seconds:g}s by {args.editor_model}. Press Ctrl-C to stop."
+        )
+        if not args.vad:
+            threading.Thread(target=commit_loop, daemon=True, name="audio-commit-loop").start()
+        threading.Thread(target=edit_loop, daemon=True, name="deck-editor").start()
+        try:
+            # time.sleep, not Event.wait: a blocking wait is not reliably
+            # interrupted by Ctrl-C on Windows.
+            while not stream.stop.is_set():
+                time.sleep(0.25)
+        finally:
+            stream.close()
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def main() -> None:
@@ -740,6 +1318,72 @@ def main() -> None:
         help="Localhost port for --web (default: 8000).",
     )
     parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        help=(
+            "Transcribe continuously and revise the deck on a timer, instead of "
+            "asking the speech-to-speech model to edit while it listens."
+        ),
+    )
+    parser.add_argument(
+        "--vad",
+        action="store_true",
+        help=(
+            "With --transcribe, let the server segment turns instead of committing on a "
+            "timer. Sentences come out cleaner, but no text arrives until you stop "
+            f"speaking. Needs one of: {', '.join(VAD_CAPABLE_MODELS)}."
+        ),
+    )
+    parser.add_argument(
+        "--transcribe-model",
+        default=TRANSCRIBE_MODEL,
+        help=f"Transcription model for --transcribe (default: {TRANSCRIBE_MODEL}).",
+    )
+    parser.add_argument(
+        "--esp32",
+        action="store_true",
+        help=(
+            "Take audio from the ESP32 over Bluetooth serial instead of a local "
+            "microphone, using the frame format in parse_audio.py. Its buttons wipe "
+            "the deck, start a new slide, and pause."
+        ),
+    )
+    parser.add_argument(
+        "--serial-port",
+        help="Serial port for --esp32 (default: auto-detect, as parse_audio.py does).",
+    )
+    parser.add_argument(
+        "--esp32-baud",
+        type=int,
+        default=ESP32_BAUD,
+        help=f"Baud for --esp32 (default: {ESP32_BAUD}; Bluetooth SPP ignores it).",
+    )
+    parser.add_argument(
+        "--device",
+        help="Input device name or index for the local microphone (default: system default).",
+    )
+    parser.add_argument(
+        "--commit-seconds",
+        type=float,
+        default=TRANSCRIBE_COMMIT_SECONDS,
+        help=(
+            "With --transcribe and no --vad, how often to close a transcription turn "
+            f"(default: {TRANSCRIBE_COMMIT_SECONDS:g}). Text still streams between commits; "
+            "committing more often only chops sentences and costs accuracy."
+        ),
+    )
+    parser.add_argument(
+        "--editor-model",
+        default=EDITOR_MODEL,
+        help=f"Model that rewrites slides for --transcribe (default: {EDITOR_MODEL}).",
+    )
+    parser.add_argument(
+        "--editor-seconds",
+        type=float,
+        default=1.0,
+        help="How often --transcribe revises the current slide (default: 1.0).",
+    )
+    parser.add_argument(
         "--push",
         metavar="URL",
         help=(
@@ -750,8 +1394,11 @@ def main() -> None:
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=0.5,
-        help="Seconds of continuous microphone audio before each deck decision (default: 0.5).",
+        default=2.0,
+        help=(
+            "Longest run of audio before a forced deck decision; a pause in speech "
+            "commits sooner (default: 2.0)."
+        ),
     )
     args = parser.parse_args()
 
@@ -759,10 +1406,21 @@ def main() -> None:
     if not api_key:
         raise SystemExit("Set OPENAI_API_KEY before running this program.")
 
-    if not args.microphone and not args.prompt:
-        parser.error("provide a prompt or use --microphone")
+    if not args.microphone and not args.prompt and not args.transcribe:
+        parser.error("provide a prompt, or use --microphone or --transcribe")
     if args.chunk_seconds <= 0:
         parser.error("--chunk-seconds must be greater than zero")
+    if args.editor_seconds <= 0:
+        parser.error("--editor-seconds must be greater than zero")
+    if args.commit_seconds <= 0:
+        parser.error("--commit-seconds must be greater than zero")
+    # Catch this here rather than letting the session be rejected mid-connect,
+    # where the message is buried under two unrelated fallback attempts.
+    if args.vad and args.transcribe_model not in VAD_CAPABLE_MODELS:
+        parser.error(
+            f"{args.transcribe_model} does not support turn detection. Either drop --vad, "
+            f"or pass --transcribe-model with one of: {', '.join(VAD_CAPABLE_MODELS)}"
+        )
 
     push_token = os.environ.get("SLIDEX_PUSH_TOKEN", "")
     if args.push and not push_token:
@@ -770,6 +1428,21 @@ def main() -> None:
 
     web_server = start_web_server(args.web_port) if args.web else None
     stop_publisher = start_deck_publisher(args.push, push_token) if args.push else None
+
+    if args.transcribe:
+        try:
+            run_transcription_mode(api_key, args)
+        except KeyboardInterrupt:
+            trace("Stopped.")
+        finally:
+            IMAGE_WORKERS.shutdown(wait=False, cancel_futures=True)
+            if stop_publisher is not None:
+                stop_publisher.set()
+            if web_server is not None:
+                web_server.shutdown()
+                web_server.server_close()
+        return
+
     client = RealtimeToolClient(api_key)
     try:
         if args.microphone:

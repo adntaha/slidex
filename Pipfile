@@ -6,6 +6,7 @@ name = "pypi"
 [packages]
 websocket-client = "*"
 sounddevice = "*"
+pyserial = "*"
 
 [dev-packages]
 
