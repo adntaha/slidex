@@ -9,8 +9,8 @@ slides are illustrated automatically from Wikimedia Commons.
 
 ```bash
 pipenv install
-export OPENAI_API_KEY=sk-...
-pipenv run python slidex.py --microphone --web
+# add env vars to .env
+pipenv run python slidex.py --transcribe --esp32 --web --push https://slidex-hackmit-2026-one.vercel.app/api/slides
 ```
 
 Then open <http://127.0.0.1:8000>. Use `←`/`→`, `Space`, or the on-screen
