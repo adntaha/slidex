@@ -18,6 +18,7 @@ import contextlib
 import json
 import os
 import platform
+import socket
 import sys
 import threading
 import time
@@ -81,10 +82,20 @@ IMAGE_SEARCH_TIMEOUT = 12
 
 SLIDES: list[dict[str, Any]] = []
 DECK_LOCK = threading.RLock()
+# The display receives this with every snapshot so its status matches the audio gate.
+DECK_PAUSED = threading.Event()
+DECK_VERSION = 0
+ACTIVE_SLIDE_ID: int | None = None
 # Image lookups are HTTP calls. They must never run on the Realtime event loop:
 # a slow one stalls every response, and the microphone backs up behind it.
 IMAGE_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="image-search")
 _LAST_SLIDE_ID = 0
+
+
+def mark_deck_changed() -> None:
+    """Advance a version that lets viewers discard an older published deck."""
+    global DECK_VERSION
+    DECK_VERSION = max(DECK_VERSION + 1, time.time_ns())
 
 
 def new_slide(kind: str, title: str) -> dict[str, Any]:
@@ -92,6 +103,7 @@ def new_slide(kind: str, title: str) -> dict[str, Any]:
     global _LAST_SLIDE_ID
     with DECK_LOCK:
         _LAST_SLIDE_ID += 1
+        mark_deck_changed()
         return {"id": _LAST_SLIDE_ID, "kind": kind, "title": title, "bullets": []}
 
 
@@ -141,6 +153,9 @@ def deck_snapshot() -> dict[str, Any]:
     """Create a stable copy for the local browser without exposing tool internals."""
     with DECK_LOCK:
         return {
+            "version": DECK_VERSION,
+            "paused": DECK_PAUSED.is_set(),
+            "active_slide_id": ACTIVE_SLIDE_ID,
             "slides": [
                 {
                     "id": slide["id"],
@@ -174,9 +189,11 @@ def create_title_slide(title: str) -> dict[str, Any]:
 
 
 def append_content_slide(title: str) -> dict[str, Any]:
+    global ACTIVE_SLIDE_ID
     with DECK_LOCK:
         slide = new_slide("content", title)
         SLIDES.append(slide)
+        ACTIVE_SLIDE_ID = slide["id"]
         trace(f"NEW SLIDE #{len(SLIDES)}: {title}")
         return slide
 
@@ -209,12 +226,15 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
 
         slide = current_content_slide()
         assert slide is not None
-        continued = len(slide["bullets"]) >= MAX_BULLETS_PER_SLIDE
-        if continued:
-            title = slide["title"]
-            if not title.lower().endswith("(continued)"):
-                title = f"{title} (continued)"
-            slide = append_content_slide(title)
+        if len(slide["bullets"]) >= MAX_BULLETS_PER_SLIDE:
+            return {
+                "status": "ignored",
+                "reason": (
+                    "The current slide is full. Do not create a continuation slide; "
+                    "wait for a genuinely new topic and create a newly titled slide."
+                ),
+                **slide_state(),
+            }
         slide["bullets"].append(cleaned)
         trace(f"BULLET #{len(slide['bullets'])}: • {cleaned}")
         # Illustrate each content slide once, in the background. The tool result
@@ -225,7 +245,6 @@ def new_bullet_point(bullet_point: str, slide_title: str | None = None) -> dict[
         return {
             "status": "saved",
             "bullet_number": len(slide["bullets"]),
-            "continued": continued,
             **slide_state(),
         }
 
@@ -318,6 +337,10 @@ TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "new_bullet_point": new_bullet_point,
     "update_bullet_point": update_bullet_point,
 }
+
+# The local display can send the same command as a physical controller. This is
+# intentionally process-local: a hosted viewer must not control the recorder.
+ACTIVE_DECK_COMMAND: Callable[[str], None] | None = None
 
 TOOLS = [
     {
@@ -424,6 +447,25 @@ class DeckRequestHandler(BaseHTTPRequestHandler):
             self._send(200, "application/json; charset=utf-8", body)
         else:
             self._send(404, "text/plain; charset=utf-8", b"Not found\n")
+
+    def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self.path != "/api/command":
+            self._send(404, "text/plain; charset=utf-8", b"Not found\n")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            self._send(400, "text/plain; charset=utf-8", b"Bad command length\n")
+            return
+        command = self.rfile.read(min(max(length, 0), 64)).decode("ascii", "replace").strip()
+        if command not in DECK_COMMANDS:
+            self._send(400, "text/plain; charset=utf-8", b"Unknown command\n")
+            return
+        if ACTIVE_DECK_COMMAND is None:
+            self._send(409, "text/plain; charset=utf-8", b"Recorder is not running\n")
+            return
+        ACTIVE_DECK_COMMAND(command)
+        self._send(200, "application/json; charset=utf-8", json.dumps(deck_snapshot()).encode())
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)
@@ -543,15 +585,22 @@ class RealtimeToolClient:
                         "partial phrases, and uncertain audio are not deck content. If you are not highly "
                         "confident the statement is from the main speaker and can be recorded without adding "
                         "meaning, make no tool call. Do not reinterpret a statement through the lens of the "
-                        "current slide's topic. As soon as the opening topic is clear, first call "
+                        "current slide's topic. Preserve the speaker's language in every title and bullet: never "
+                        "translate it into English or any other language. As soon as the opening topic is clear, first call "
                         "create_title_slide with a concise presentation title. Then, when there is a substantive "
                         "point, create a separate content slide with create_new_slide before adding bullets. Do "
                         "not make the title slide from a greeting, filler, or an unclear fragment. Add a concise,"
                         " standalone bullet only for substantive, sufficiently complete ideas. Do not add bullets"
                         " for filler, false starts, or repetition. When later speech corrects or meaningfully "
                         "refines a current-slide bullet, use update_bullet_point instead of adding a duplicate. "
+                        "Preserve established, detailed bullets as written; do not expand, condense, or rephrase "
+                        "them unless the speaker explicitly corrects or substantially refines that exact point. "
                         "When one coherent topic is finished and the speaker begins a genuinely new topic, call "
-                        "create_new_slide with a short title before adding that topic's bullets. Treat a clear, "
+                        "create_new_slide with a short title before adding that topic's bullets. Earlier slides "
+                        "are immutable: never retitle, edit, or add bullets to a slide once a newer content slide "
+                        "exists. Never create a '(continued)' slide merely because the current slide is full; wait "
+                        "for a genuinely new topic and give that new slide a title based on what the speaker starts "
+                        "saying after the transition. Treat a clear, "
                         "explicitly stated change of subject, entity, timeframe, or question as a new topic; do "
                         "not force it into the current slide or rewrite a current bullet merely because it was "
                         "the latest one. Every tool result lists the whole deck: check it before assuming the "
@@ -680,15 +729,9 @@ class RealtimeToolClient:
         self.socket.close()
 
 
-def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
+def stream_microphone(client: RealtimeToolClient, args: argparse.Namespace) -> None:
     """Send PCM continuously and manually ask for a deck decision every few seconds."""
-    try:
-        import sounddevice as sd
-    except ImportError as exc:
-        raise SystemExit("Install Python dependencies first: pipenv install") from exc
-    except OSError as exc:
-        raise SystemExit(PORTAUDIO_HINT) from exc
-
+    chunk_seconds = args.chunk_seconds
     stop_commits = threading.Event()
     boundary = threading.Event()
     buffered_bytes = 0
@@ -700,7 +743,7 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
     max_buffered_bytes = int(MAX_BUFFERED_AUDIO_SECONDS * AUDIO_RATE * 2)
     min_utterance_bytes = int(MIN_UTTERANCE_SECONDS * AUDIO_RATE * 2)
 
-    def on_audio(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+    def on_audio(raw_audio: bytes) -> None:
         """Buffer speech only.
 
         Silence must never reach the model. Committing a window of it asks what
@@ -708,9 +751,6 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
         answers by inventing a plausible next bullet.
         """
         nonlocal buffered_bytes, speech_bytes, dropping, silent_seconds
-        if status:
-            trace(f"Microphone status: {status}")
-        raw_audio = bytes(indata)
         samples = array.array("h", raw_audio)
         speaking = bool(samples) and max(abs(min(samples)), abs(max(samples))) >= SILENCE_PEAK
 
@@ -771,16 +811,22 @@ def stream_microphone(client: RealtimeToolClient, chunk_seconds: float) -> None:
             client.begin_manual_audio_turn()
 
     client.configure(manual_audio_turns=True)
-    trace("Opening the default 24 kHz mono PCM microphone device...")
-    with sd.RawInputStream(
-        samplerate=24000,
-        blocksize=2400,  # 100 ms chunks
-        channels=1,
-        dtype="int16",
-        callback=on_audio,
-    ):
+    # This mode has no editor state for a button to act on, so the ESP32's
+    # buttons only gate the audio here; the deck commands live in --transcribe.
+    DECK_PAUSED.clear()
+
+    def on_button(command: str) -> None:
+        if command == "CMD_PAUSE":
+            DECK_PAUSED.clear() if DECK_PAUSED.is_set() else DECK_PAUSED.set()
+            trace(f"COMMAND CMD_PAUSE: {'paused' if DECK_PAUSED.is_set() else 'resumed'}.")
+        else:
+            trace(f"COMMAND {command} is only wired up in --transcribe mode.")
+
+    global ACTIVE_DECK_COMMAND
+    ACTIVE_DECK_COMMAND = on_button
+    with audio_source(args, on_audio, on_button, DECK_PAUSED):
         trace(
-            f"Microphone is live. A deck decision runs at each pause, and at least every "
+            f"Audio is live. A deck decision runs at each pause, and at least every "
             f"{chunk_seconds:g} seconds; "
             "assistant text remains hidden. Press Ctrl-C to stop."
         )
@@ -841,16 +887,23 @@ EDITOR_SYSTEM = (
     "speaker actually said: never add a fact, entity, or theme that is not in the "
     "transcript. Ignore filler, false starts, repetition, and anything that reads "
     "like background conversation. "
+    "Preserve the transcript's original language in every title and bullet. Never translate it into English "
+    "or any other language. "
     "Keep bullets short and standalone, and keep wording stable between calls -- "
     "you are shown your own previous output, and rewording it for no reason makes "
-    "the deck flicker for the audience. "
-    f"Never exceed {MAX_BULLETS_PER_SLIDE} bullets. "
+    "the deck flicker for the audience. Preserve existing detailed bullets verbatim unless the speaker explicitly "
+    "corrects or substantially refines that specific point; do not rewrite them just to improve style or coverage. "
+    f"A slide shows {MAX_BULLETS_PER_SLIDE} bullets. If the speaker has said more than "
+    f"fits, list all of it anyway: the deck rolls whatever does not fit onto a "
+    f"continuation slide, so nothing is lost. Never drop a point to stay under the limit. "
     "Reply with one JSON object choosing an action: "
     "'none' when the transcript adds nothing worth showing; "
     "'title' for the deck's opening title slide, once, when the subject first becomes clear; "
     "'update' to rewrite the current slide; "
     "'new' when the speaker has clearly moved to a different subject, in which case "
-    "the finished slide is frozen and your title and bullets begin the next one."
+    "the finished slide is frozen and your title and bullets begin the next one. "
+    "Treat explicit transitions such as 'moving on', 'next', 'let's talk about', or 'now I will discuss' "
+    "as a mandatory 'new' action, even when the previous slide is not full."
 )
 
 EDITOR_SCHEMA = {
@@ -926,6 +979,11 @@ class TranscriptStream:
             parts = [*self.settled[mark:], *self.pending.values()]
         return " ".join(part.strip() for part in parts if part.strip())
 
+    def discard_pending(self) -> None:
+        """Forget partial audio text when the presenter resets the deck."""
+        with self._lock:
+            self.pending.clear()
+
     def read_events(self) -> None:
         while not self.stop.is_set():
             try:
@@ -982,38 +1040,83 @@ def edit_deck(api_key: str, model: str, payload: dict[str, Any]) -> dict[str, An
         return None
 
 
+def request_slide_image(slide: dict[str, Any]) -> None:
+    """Illustrate a slide once, in the background, as soon as it has content."""
+    if slide["bullets"] and not slide.get("image_requested"):
+        slide["image_requested"] = True
+        IMAGE_WORKERS.submit(load_slide_image, slide, f"{slide['title']} {slide['bullets'][0]}")
+
+
+def continued_title(title: str) -> str:
+    return title if title.lower().endswith("(continued)") else f"{title} (continued)"
+
+
+def fill_slide(slide: dict[str, Any], title: str, bullets: list[str]) -> bool:
+    """Write a slide, rolling anything past the cap onto continuation slides.
+
+    A full slide must not silently swallow what the speaker just said. Dropping
+    the sixth bullet loses the point entirely, so the overflow starts the next
+    slide instead -- which is what the speaker would have wanted anyway.
+
+    Returns whether the deck grew, because that means the slide being written is
+    no longer the one the caller started with.
+    """
+    with DECK_LOCK:
+        head, overflow = bullets[:MAX_BULLETS_PER_SLIDE], bullets[MAX_BULLETS_PER_SLIDE:]
+        if (slide["title"], slide["bullets"]) != (title, head):
+            slide["title"] = title
+            slide["bullets"] = head
+            request_slide_image(slide)
+            trace(f"SLIDE #{SLIDES.index(slide) + 1} '{title}': {len(head)} bullet(s)")
+
+        spilled = False
+        rolling = title
+        while overflow:
+            spilled = True
+            rolling = continued_title(rolling)
+            slide = append_content_slide(rolling)
+            slide["bullets"] = overflow[:MAX_BULLETS_PER_SLIDE]
+            overflow = overflow[MAX_BULLETS_PER_SLIDE:]
+            request_slide_image(slide)
+            trace(f"SLIDE #{len(SLIDES)} '{rolling}': {len(slide['bullets'])} bullet(s) rolled over")
+        return spilled
+
+
 def apply_edit(edit: dict[str, Any], stream: TranscriptStream, mark: int) -> int:
     """Fold one editor decision into the deck; return the new transcript mark."""
     action = edit.get("action", "none")
     title = (edit.get("title") or "").strip()
-    bullets = [b.strip() for b in edit.get("bullets", []) if b and b.strip()][:MAX_BULLETS_PER_SLIDE]
+    bullets = [b.strip() for b in edit.get("bullets", []) if b and b.strip()]
 
-    if action == "none" or (action != "none" and not title):
+    if action == "none" or not title:
         return mark
     with DECK_LOCK:
         if action == "title":
             create_title_slide(title)
             return mark
         if action == "new":
-            slide = append_content_slide(title)
-            slide["bullets"] = bullets
-            if bullets and not slide.get("image_requested"):
-                slide["image_requested"] = True
-                IMAGE_WORKERS.submit(load_slide_image, slide, f"{title} {bullets[0]}")
-            trace(f"SLIDE #{len(SLIDES)} '{title}' with {len(bullets)} bullet(s)")
+            # CMD_NEXT creates an empty visible destination immediately. The
+            # next editor result belongs there; appending again would leave a
+            # blank slide behind and make the deck jump two slides.
+            current = current_content_slide()
+            target = (
+                current
+                if current is not None and not current["title"].strip() and not current["bullets"]
+                else append_content_slide(title)
+            )
+            fill_slide(target, title, bullets)
             # A new slide means the previous one is finished: measure the next
             # slide's span from here rather than replaying the whole talk.
             return stream.mark()
+
         slide = current_content_slide()
         if slide is None:
             slide = append_content_slide(title)
-        if (slide["title"], slide["bullets"]) != (title, bullets):
-            slide["title"] = title
-            slide["bullets"] = bullets
-            if bullets and not slide.get("image_requested"):
-                slide["image_requested"] = True
-                IMAGE_WORKERS.submit(load_slide_image, slide, f"{title} {bullets[0]}")
-            trace(f"SLIDE #{SLIDES.index(slide) + 1} '{title}' now has {len(bullets)} bullet(s)")
+        if fill_slide(slide, title, bullets):
+            # The overflow opened a slide of its own, so the span that produced
+            # it belongs to the slide before. Start the next one from here, or
+            # the editor would regenerate the same bullets and split again.
+            return stream.mark()
     return mark
 
 
@@ -1081,10 +1184,21 @@ def esp32_audio(args: argparse.Namespace, deliver: Callable[[bytes], None],
     trace(f"Opening the ESP32 stream on {port} ({ESP32_RATE} Hz -> {AUDIO_RATE} Hz)...")
     try:
         link = serial.Serial(port, args.esp32_baud, timeout=1)
+        # Whatever a previous reader left buffered is mid-frame, and consuming it
+        # lands one byte into a header -- which then decodes as a button press.
+        link.reset_input_buffer()
     except serial.SerialException as exc:
         raise SystemExit(f"Could not open {port}: {exc}") from exc
 
     stop = threading.Event()
+
+    # Only these bits can legitimately appear in a button snapshot. Anything else
+    # means we are not looking at one: a dropped byte slides the frame and the
+    # header magic lands in this position, where 0xBB and 0xDD both decode as
+    # WIPE -- clearing the deck mid-talk because the link hiccuped.
+    button_mask = 0
+    for bit, _ in parse_audio.BUTTONS:
+        button_mask |= bit
 
     def pump() -> None:
         resample = Resampler(ESP32_RATE, AUDIO_RATE)
@@ -1093,6 +1207,7 @@ def esp32_audio(args: argparse.Namespace, deliver: Callable[[bytes], None],
         # at startup is their resting state, and treating that as a press fires
         # a phantom command before the speaker has touched anything.
         previous: int | None = None
+        desyncs = 0
         while not stop.is_set():
             try:
                 parse_audio.wait_for_header(link)
@@ -1103,6 +1218,16 @@ def esp32_audio(args: argparse.Namespace, deliver: Callable[[bytes], None],
                 return
             if frame is None:
                 continue  # truncated mid-frame; wait_for_header resynchronises
+
+            if frame[0] & ~button_mask:
+                # Impossible as a button snapshot, so the frame is misaligned.
+                # Drop it, and re-seed the edge detector so the first good frame
+                # after the gap is treated as a resting state, not a press.
+                desyncs += 1
+                if desyncs in (1, 10, 100):
+                    trace(f"ESP32 frame out of step ({desyncs}); resynchronising.")
+                previous = None
+                continue
 
             # Rising edges only, so a held button fires once.
             if previous is not None:
@@ -1127,6 +1252,89 @@ def esp32_audio(args: argparse.Namespace, deliver: Callable[[bytes], None],
     finally:
         stop.set()
         link.close()
+
+
+DECK_COMMANDS = ("CMD_WIPE", "CMD_PAUSE", "CMD_NEXT")
+COMMAND_PORT = 5005  # the port parse_audio.py already publishes button presses on
+
+
+def deck_command_handler(stream: TranscriptStream, state: dict[str, Any],
+                         state_lock: threading.Lock, paused: threading.Event
+                         ) -> Callable[[str], None]:
+    """Build the callback that ESP32 buttons and UDP commands both drive.
+
+    Kept out of run_transcription_mode so the three deck actions can be
+    exercised without a microphone, a serial link, or an API key.
+    """
+
+    def close_current_slide() -> None:
+        # Moving the mark and bumping the generation together means the next
+        # edit starts from a blank slide, and any edit still in flight against
+        # the old one is discarded rather than landing on the new one.
+        with state_lock:
+            state["mark"] = stream.mark()
+            state["generation"] += 1
+            state["last_text"] = ""
+
+    def handle(command: str) -> None:
+        global ACTIVE_SLIDE_ID
+        if command == "CMD_WIPE":
+            with DECK_LOCK:
+                SLIDES.clear()
+                mark_deck_changed()
+                ACTIVE_SLIDE_ID = None
+            stream.discard_pending()
+            close_current_slide()
+            trace("COMMAND CMD_WIPE: deck cleared.")
+        elif command == "CMD_NEXT":
+            # Create the visible destination at once. It remains intentionally
+            # blank until subsequent speech gives the editor enough context to
+            # title and fill it, while the old slide is already frozen.
+            with DECK_LOCK:
+                append_content_slide("")
+            close_current_slide()
+            trace("COMMAND CMD_NEXT: blank slide created and selected.")
+        elif command == "CMD_PAUSE":
+            if paused.is_set():
+                paused.clear()
+                trace("COMMAND CMD_PAUSE: resumed, audio is flowing again.")
+            else:
+                paused.set()
+                trace("COMMAND CMD_PAUSE: paused, audio is being dropped.")
+        else:
+            trace(f"Ignoring unknown deck command {command!r}")
+
+    return handle
+
+
+def listen_for_commands(on_command: Callable[[str], None], port: int,
+                        stop: threading.Event) -> None:
+    """Accept deck commands over UDP.
+
+    parse_audio.py already sends button presses here and nothing was listening.
+    Anything that speaks the same datagrams can drive the deck, which is also
+    how these actions get tested when the hardware is not reporting presses.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError as exc:
+        trace(f"Deck commands unavailable on port {port}: {exc}")
+        sock.close()
+        return
+    sock.settimeout(0.5)
+    trace(f"Deck commands accepted on udp://127.0.0.1:{port} ({', '.join(DECK_COMMANDS)})")
+    try:
+        while not stop.is_set():
+            try:
+                data, _ = sock.recvfrom(64)
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            on_command(data.decode("ascii", "replace").strip())
+    finally:
+        sock.close()
 
 
 @contextlib.contextmanager
@@ -1167,34 +1375,16 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
     # can come back out of order. ``sequence`` drops an answer a newer one has
     # already superseded; ``generation`` drops one written against a slide that
     # has since been closed, whose transcript span now belongs to the slide before.
-    state = {"mark": 0, "generation": 0, "applied": 0, "issued": 0, "in_flight": 0, "last_text": ""}
+    state = {
+        "mark": 0, "generation": 0, "applied": 0, "issued": 0, "in_flight": 0,
+        "last_text": "",
+    }
     state_lock = threading.Lock()
 
-    paused = threading.Event()
-
-    def close_current_slide() -> None:
-        """Start the next slide from here, whatever the editor was mid-way through."""
-        with state_lock:
-            state["mark"] = stream.mark()
-            state["generation"] += 1
-            state["last_text"] = ""
-
-    def on_button(command: str) -> None:
-        trace(f"BUTTON {command}")
-        if command == "CMD_WIPE":
-            with DECK_LOCK:
-                SLIDES.clear()
-            close_current_slide()
-        elif command == "CMD_NEXT":
-            close_current_slide()
-        elif command == "CMD_PAUSE":
-            if paused.is_set():
-                paused.clear()
-                trace("Resumed; audio is flowing again.")
-            else:
-                paused.set()
-                trace("Paused; audio is being dropped until the next press.")
-
+    DECK_PAUSED.clear()
+    on_button = deck_command_handler(stream, state, state_lock, DECK_PAUSED)
+    global ACTIVE_DECK_COMMAND
+    ACTIVE_DECK_COMMAND = on_button
     appended = threading.Event()
 
     def deliver(raw_audio: bytes) -> None:
@@ -1241,6 +1431,13 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
             }
 
     def run_edit(sequence: int, generation: int, payload: dict[str, Any]) -> None:
+        # A reset or Next may happen while this job waits in the executor. Do
+        # not spend an editor request on a deck generation that no longer exists.
+        with state_lock:
+            if generation != state["generation"]:
+                state["in_flight"] -= 1
+                trace(f"Discarding queued edit #{sequence}: deck was reset or advanced.")
+                return
         try:
             edit = edit_deck(api_key, args.editor_model, payload)
         finally:
@@ -1280,7 +1477,10 @@ def run_transcription_mode(api_key: str, args: argparse.Namespace) -> None:
             pool.submit(run_edit, sequence, generation, build_payload(spoken))
 
     threading.Thread(target=stream.read_events, daemon=True, name="transcript").start()
-    with audio_source(args, deliver, on_button, paused):
+    if args.commands_port:
+        threading.Thread(target=listen_for_commands, daemon=True, name="deck-commands",
+                         args=(on_button, args.commands_port, stream.stop)).start()
+    with audio_source(args, deliver, on_button, DECK_PAUSED):
         trace(
             f"Audio is live. Transcribing continuously; the deck is revised every "
             f"{args.editor_seconds:g}s by {args.editor_model}. Press Ctrl-C to stop."
@@ -1361,6 +1561,15 @@ def main() -> None:
     parser.add_argument(
         "--device",
         help="Input device name or index for the local microphone (default: system default).",
+    )
+    parser.add_argument(
+        "--commands-port",
+        type=int,
+        default=COMMAND_PORT,
+        help=(
+            f"UDP port to accept deck commands on (default: {COMMAND_PORT}, the port "
+            "parse_audio.py already sends button presses to). 0 disables it."
+        ),
     )
     parser.add_argument(
         "--commit-seconds",
@@ -1447,7 +1656,7 @@ def main() -> None:
     try:
         if args.microphone:
             # trace("Starting continuous microphone mode.")
-            stream_microphone(client, args.chunk_seconds)
+            stream_microphone(client, args)
         else:
             client.ask(args.prompt)
         trace(f"Completed {len(client.tool_calls)} tool call(s).")

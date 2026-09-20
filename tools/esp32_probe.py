@@ -31,11 +31,56 @@ import parse_audio  # noqa: E402  - reuse the framing rather than restate it
 PLAUSIBLE_RATES = (8000, 16000, 22050, 24000, 32000, 44100, 48000)
 
 
+def watch_buttons(ser, seconds: float) -> int:
+    """Print the raw button byte every time it changes.
+
+    Deliberately assumption-free: no bit names, no edge logic, no guess at
+    whether a button reads high or low when pressed. Press them one at a time
+    and the mapping reads itself off the output.
+    """
+    print("Press each button in turn. Raw byte changes only:\n")
+    started = time.monotonic()
+    previous = None
+    changes = 0
+    parse_audio.wait_for_header(ser)
+    while time.monotonic() - started < seconds:
+        frame = parse_audio.read_exact(ser, 1 + parse_audio.AUDIO_PAYLOAD_SIZE)
+        if frame is None:
+            parse_audio.wait_for_header(ser)
+            continue
+        current = frame[0]
+        if previous is not None and current != previous:
+            changes += 1
+            rose = current & ~previous
+            fell = previous & ~current
+            detail = []
+            if rose:
+                detail.append(f"bits set {rose:#04x} ({rose:08b})")
+            if fell:
+                detail.append(f"bits cleared {fell:#04x} ({fell:08b})")
+            print(f"  [{time.monotonic() - started:5.2f}s]  {previous:08b} -> {current:08b}"
+                  f"   {'; '.join(detail)}")
+        elif previous is None:
+            print(f"  [{time.monotonic() - started:5.2f}s]  resting value {current:08b} ({current:#04x})")
+        previous = current
+        parse_audio.wait_for_header(ser)
+
+    print(f"\n{changes} change(s) seen.")
+    if not changes:
+        print("  Nothing moved. Either no button was pressed, or presses never reach")
+        print("  the button byte -- in which case the firmware is not reporting them.")
+    else:
+        print("  Map each bit to a command in parse_audio.BUTTONS using the above.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", help="serial port (default: auto-detect the ESP32)")
     parser.add_argument("--baud", type=int, default=parse_audio.BAUD_RATE)
     parser.add_argument("--seconds", type=float, default=10.0)
+    parser.add_argument("--watch-buttons", action="store_true",
+                        help="print raw button-byte changes instead of measuring audio")
     args = parser.parse_args()
 
     try:
@@ -47,9 +92,18 @@ def main() -> int:
     print(f"Opening {port} at {args.baud} baud for {args.seconds:g}s...")
     try:
         ser = serial.Serial(port, args.baud, timeout=1)
+        # Whatever the last reader left buffered is mid-frame, and reading it
+        # lands us one byte into a header -- which then decodes as a button press.
+        ser.reset_input_buffer()
     except serial.SerialException as exc:
         print(f"Could not open {port}: {exc}", file=sys.stderr)
         return 1
+
+    if args.watch_buttons:
+        try:
+            return watch_buttons(ser, args.seconds)
+        finally:
+            ser.close()
 
     frames = 0
     truncated = 0

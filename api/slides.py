@@ -76,12 +76,21 @@ def read_deck() -> dict[str, Any]:
     return deck if isinstance(deck, dict) and "slides" in deck else EMPTY_DECK
 
 
-def write_deck(deck: dict[str, Any]) -> None:
+def deck_version(deck: dict[str, Any]) -> int:
+    version = deck.get("version", 0)
+    return version if isinstance(version, int) and not isinstance(version, bool) else 0
+
+
+def write_deck(deck: dict[str, Any]) -> bool:
+    """Store a snapshot unless a newer publisher has already won."""
+    if deck_version(deck) < deck_version(read_deck()):
+        return False
     raw = json.dumps(deck)
     if credentials() is None:
         _fallback[DECK_KEY] = raw
-        return
+        return True
     kv_command("SET", DECK_KEY, raw)
+    return True
 
 
 class handler(BaseHTTPRequestHandler):  # noqa: N801 - name required by the Vercel Python runtime
@@ -126,11 +135,11 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 - name required by the Verc
             return
 
         try:
-            write_deck(deck)
+            accepted = write_deck(deck)
         except StoreUnavailable as exc:
             self._send(503, {"error": str(exc)})
             return
-        self._send(200, {"status": "published", "slides": len(deck["slides"])})
+        self._send(200, {"status": "published" if accepted else "stale", "slides": len(deck["slides"])})
 
     def _send(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode()
