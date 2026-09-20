@@ -13,12 +13,18 @@ pipenv install
 pipenv run python slidex.py --transcribe --esp32 --web --push https://slidex-hackmit-2026-one.vercel.app/api/slides
 ```
 
-Then open <http://127.0.0.1:8000>. Use `←`/`→`, `Space`, or the on-screen
+Then open <http://127.0.0.1:8000>: a landing page whose **Start presenting**
+button opens the deck at `/deck`. There, use `←`/`→`, `Space`, or the on-screen
 buttons to move between slides; the view follows the slide being written and
 otherwise stays where you left it.
 
 Microphone capture needs the PortAudio runtime (`sudo apt-get install
 libportaudio2` on Debian/Ubuntu).
+
+Pressing the reset button (`CMD_WIPE`, from the ESP32 or UDP) clears the deck --
+and first writes every slide to a single 16:9 PDF in `exports/`, named after the
+deck's title and the time. Pictures are downloaded for the file, so it lands a
+few seconds after the reset; the deck itself clears at once.
 
 ## Options
 
@@ -76,7 +82,8 @@ off the Realtime event loop.
 
 | Route | |
 | --- | --- |
-| `GET /` | the deck UI, from `public/index.html` |
+| `GET /` | the landing page, from `public/index.html` |
+| `GET /deck` | the deck UI, from `public/deck.html` |
 | `GET /api/slides` | current deck; `503` if the store is unreachable |
 | `POST /api/slides` | publish a deck; `Authorization: Bearer $SLIDEX_PUSH_TOKEN` |
 
@@ -128,7 +135,9 @@ transcript stream if you want to check transcription quality on its own.
 - `slidex.py` — deck state and the tool handlers the model calls, a tiny HTTP
   server exposing `GET /api/slides`, the Realtime WebSocket client, and the
   optional publisher that mirrors the deck to a deployment.
-- `public/index.html` — polls `/api/slides` twice a second and diffs the deck into
+- `deck_pdf.py` — writes a deck snapshot to a PDF when the deck is reset.
+- `public/index.html` — the landing page; one screen and a button to the deck.
+- `public/deck.html` — polls `/api/slides` twice a second and diffs the deck into
   the DOM, keyed by stable slide ids so inserts (the title slide goes at the
   front) don't rewrite the wrong card. The slide frame is a CSS container, so
   type and spacing scale with the slide rather than the window, and a measured

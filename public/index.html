@@ -5,402 +5,49 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SlideX</title>
 <style>
-/* The frame is the sizing context for everything on a slide, so type and
-   spacing stay proportional to the slide instead of to the browser window. */
+/* One screen, no scrolling: the page exists to get a speaker to the deck. It
+   borrows the deck page's palette so the hand-off does not look like a
+   different product. */
 :root{color:#202124;background:#f1f3f4;font-family:Arial,Helvetica,sans-serif}
 *{box-sizing:border-box}
-body{min-height:100vh;margin:0;background:#f1f3f4}
-header{height:54px;padding:0 22px;display:flex;align-items:center;justify-content:space-between;background:#fff;border-bottom:1px solid #dadce0}
-h1,h2,p{margin:0}
+body{height:100vh;margin:0;display:flex;flex-direction:column;background:#f1f3f4;overflow:hidden}
+header{height:54px;flex:none;padding:0 22px;display:flex;align-items:center;justify-content:space-between;background:#fff;border-bottom:1px solid #dadce0}
+h1,h2,h3,p{margin:0}
 h1{color:#5f6368;font-size:.78rem;letter-spacing:.08em}
-#status{color:#188038;font:700 .7rem "Courier New",monospace}
-#stage{min-height:calc(100vh - 54px);padding:clamp(18px,4vh,46px) clamp(14px,6vw,96px) 76px;display:grid;place-items:center}
-main{container-type:size;container-name:frame;width:min(100%,1240px);aspect-ratio:16/9;position:relative;background:#fff;box-shadow:0 3px 15px #2021242b;overflow:hidden}
-.empty{width:100%;height:100%;display:grid;place-items:center;color:#5f6368;font-size:clamp(1.2rem,3cqw,2.2rem)}
-
-/* Slides stack inside the frame; only the active one is visible. Moving between
-   them is a transition rather than a cut, so the audience sees that the deck
-   advanced instead of seeing the content swap in place. */
-.slide{position:absolute;inset:0;padding:clamp(18px,4.6cqw,74px);display:grid;grid-template-columns:minmax(0,1fr);align-content:center;gap:clamp(14px,2.6cqw,40px);opacity:0;pointer-events:none;transform:translateX(5%);transition:opacity 260ms ease,transform 300ms cubic-bezier(.16,1,.3,1)}
-.slide.is-active{opacity:1;pointer-events:auto;transform:translateX(0)}
-.slide.is-new.is-active{animation:slide-in 480ms cubic-bezier(.16,1,.3,1)}
-
-/* Edits to a slide already on screen must draw the eye to the words that
-   changed and nowhere else. Re-animating the whole slide because one bullet
-   moved hides the very change the audience is meant to notice. */
-@keyframes bullet-in{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
-@keyframes text-changed{from{background:#d2e3fc}to{background:transparent}}
-li.is-added{animation:bullet-in 340ms cubic-bezier(.16,1,.3,1)}
-li.is-changed,h2.is-changed{animation:text-changed 1200ms ease-out;border-radius:4px}
-/* No 'to' on purpose: it defaults to the element's own opacity, so a background
-   image fades up to its washed-out .24 instead of flashing to full and dropping. */
-.slide-image{animation:image-in 420ms ease-out}
-@keyframes image-in{from{opacity:0}}
-
-/* fitContent() shrinks this block about its left edge when the text is too tall. */
-.slide-content{position:relative;z-index:1;min-width:0;transform-origin:left center}
-h2{max-width:20ch;font-size:clamp(1.5rem,4.6cqw,3.6rem);line-height:.96;letter-spacing:-.045em;font-weight:700;text-wrap:balance}
-ul{margin:clamp(14px,3.2cqh,40px) 0 0;padding:0;list-style:none;display:grid;gap:clamp(7px,1.5cqh,16px);max-width:min(100%,68ch)}
-li{color:#3c4043;font-size:clamp(.85rem,1.9cqw,1.45rem);line-height:1.25;display:grid;grid-template-columns:clamp(12px,1.5cqw,20px) 1fr;gap:clamp(6px,.8cqw,12px)}
-li::before{content:"\2022";color:#4285f4;font-size:1.3em;line-height:.8}
-
-/* Corner labels float above everything, including a background image. */
-.slide-number,.image-credit{position:absolute;bottom:clamp(9px,2.3cqh,20px);z-index:4;color:#5f6368;font-size:clamp(.5rem,.95cqw,.72rem);line-height:1.1}
-.slide-number{right:clamp(10px,1.8cqw,26px);font-family:"Courier New",monospace;font-weight:700;letter-spacing:.08em}
-.image-credit{left:clamp(10px,1.8cqw,26px);max-width:52%;padding:.35em .6em;background:#ffffffe6;color:#3c4043;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-.title-slide{background:linear-gradient(135deg,#fff 0%,#f8fbff 100%)}
-.title-slide ul{display:none}
-.title-slide h2{max-width:18ch;font-size:clamp(2rem,7cqw,5.5rem)}
-.title-slide h2::after{content:"LIVE PRESENTATION";display:block;margin-top:1.4em;color:#4285f4;font-size:.11em;letter-spacing:.12em}
-
-/* Images take a real grid column beside the text, or wash out behind it. */
-.slide-image{display:none;z-index:0}
-.has-image .slide-image{display:block}
-.has-image h2{font-size:clamp(1.3rem,3.6cqw,2.9rem)}
-.has-image li{font-size:clamp(.8rem,1.6cqw,1.2rem)}
-.image-left,.image-right{align-items:center;gap:clamp(14px,3.4cqw,52px)}
-.image-left{grid-template-columns:minmax(0,.72fr) minmax(0,1fr);grid-template-areas:"visual content"}
-.image-right{grid-template-columns:minmax(0,1fr) minmax(0,.72fr);grid-template-areas:"content visual"}
-.image-left .slide-content,.image-right .slide-content{grid-area:content}
-.image-left .slide-image,.image-right .slide-image{grid-area:visual;width:100%;height:74cqh;object-fit:cover}
-.image-background .slide-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.24}
-.image-background::after{content:"";position:absolute;inset:0;background:#fff9;pointer-events:none}
-
-#controls{position:fixed;z-index:2;bottom:18px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px;border:1px solid #dadce0;border-radius:24px;background:#fff;box-shadow:0 2px 8px #20212420}
-button{width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:#3c4043;cursor:pointer;font-size:1.4rem}
-button:hover:not(:disabled){background:#f1f3f4}
-button:disabled{color:#bdc1c6;cursor:default}
-#position{min-width:54px;color:#5f6368;font:.75rem "Courier New",monospace;text-align:center}
-
-@keyframes slide-in{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:1ms!important;transition-duration:1ms!important}}
-
-/* Narrow frames cannot hold a side-by-side image, so it goes behind the text. */
-@container frame (max-width:640px){
-  .slide,.image-left,.image-right{grid-template-columns:minmax(0,1fr);grid-template-areas:"content"}
-  .image-left .slide-image,.image-right .slide-image{grid-area:auto;position:absolute;inset:0;width:100%;height:100%;opacity:.14}
-  .has-image h2{font-size:clamp(1.5rem,4.6cqw,3.6rem)}
-  .has-image li{font-size:clamp(.85rem,1.9cqw,1.45rem)}
-  .image-credit{max-width:64%}
-}
-@media(max-width:620px){
-  header{padding:0 14px}
-  #stage{padding:20px 10px 72px}
-  main{aspect-ratio:4/3}
-}
+header a{color:#1a73e8;font-size:.8rem;text-decoration:none}
+header a:hover{text-decoration:underline}
+main{flex:1;min-height:0;display:grid;place-items:center;padding:clamp(16px,4vh,48px) clamp(14px,6vw,96px)}
+.hero{width:min(100%,900px);text-align:center;display:grid;gap:clamp(18px,3.4vh,34px);justify-items:center}
+h2{font-size:clamp(2rem,5.2vw,4.2rem);line-height:.98;letter-spacing:-.04em;font-weight:700;text-wrap:balance}
+.lede{max-width:44ch;color:#5f6368;font-size:clamp(1rem,1.6vw,1.25rem);line-height:1.45;text-wrap:pretty}
+.start{display:inline-flex;align-items:center;gap:.6em;padding:.95em 1.9em;border:0;border-radius:999px;background:#1a73e8;color:#fff;font:700 clamp(1rem,1.5vw,1.2rem) Arial,Helvetica,sans-serif;text-decoration:none;box-shadow:0 3px 15px #1a73e84d;transition:transform 160ms ease,box-shadow 160ms ease,background 160ms ease}
+.start:hover,.start:focus-visible{background:#1765cc;transform:translateY(-1px);box-shadow:0 6px 20px #1a73e866;outline:none}
+.start .dot{width:.55em;height:.55em;border-radius:50%;background:#fff;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.7)}}
+.features{width:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:clamp(10px,1.6vw,18px);text-align:left}
+.feature{padding:clamp(12px,1.8vw,20px);background:#fff;border:1px solid #dadce0;border-radius:10px;display:grid;gap:.4em;align-content:start}
+.feature h3{font-size:clamp(.85rem,1.15vw,1rem);letter-spacing:-.01em}
+.feature p{color:#5f6368;font-size:clamp(.78rem,1vw,.9rem);line-height:1.4}
+code{font-family:"Courier New",monospace;font-size:.95em}
+.hint{color:#5f6368;font:.72rem "Courier New",monospace;letter-spacing:.04em}
+@media (max-width:640px){.features{grid-template-columns:1fr}.feature p{display:none}}
+@media (max-height:520px){.features{display:none}}
 </style>
 </head>
 <body>
-<header><h1>SlideX</h1><p id="status">CONNECTING</p></header>
-<div id="stage"><main id="slides"><div class="empty">Listening for a topic...</div></main></div>
-<nav id="controls" aria-label="Presentation controls">
-  <button id="previous" aria-label="Previous slide">‹</button>
-  <span id="position">— / —</span>
-  <button id="next" aria-label="Next slide">›</button>
-</nav>
-<script>
-const slides = document.getElementById("slides");
-const statusLabel = document.getElementById("status");
-const previousButton = document.getElementById("previous");
-const nextButton = document.getElementById("next");
-const counter = document.getElementById("position");
-
-let previous = ""; // fingerprint of the deck as last drawn
-let activeIndex = 0;
-const shown = new Set(); // slide ids this page has drawn at least once
-let latestDeckVersion = 0;
-let followedSlideId = null;
-let deckActiveId = null; // the slide the recorder is writing to right now
-
-function element(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function select(index) {
-  const cards = [...slides.querySelectorAll(".slide")];
-  activeIndex = Math.max(0, Math.min(index, cards.length - 1));
-  cards.forEach((card, i) => card.classList.toggle("is-active", i === activeIndex));
-  const selected = cards[activeIndex];
-  if (selected?.classList.contains("is-new")) {
-    // Do not let DOM updates restart a creation animation. Its class is only
-    // retained for the one initial entrance.
-    setTimeout(() => selected.classList.remove("is-new"), 500);
-  }
-  syncRecording();
-  counter.textContent = cards.length ? `${activeIndex + 1} / ${cards.length}` : "— / —";
-  previousButton.disabled = activeIndex === 0;
-  // Next is never a dead end: at the last slide it starts the next one. Greying
-  // it out there removed the only pointer-driven way to add a slide, because a
-  // new slide always leaves the viewer on the last one.
-  nextButton.disabled = !cards.length;
-}
-
-// Commons occasionally serves a URL that will not load. Remember those and let
-// the slide fall back to full-width text rather than holding an empty column.
-const brokenImages = new Set();
-
-function paintImage(card, image) {
-  if (image && brokenImages.has(image.url)) image = null;
-  card.classList.remove("has-image", "image-background", "image-left", "image-right");
-  const picture = card.querySelector(".slide-image");
-  const credit = card.querySelector(".image-credit");
-  if (!image) {
-    picture?.remove();
-    credit?.remove();
-    return;
-  }
-  const node = picture ?? card.appendChild(element("img", "slide-image"));
-  node.onerror = () => {
-    brokenImages.add(image.url);
-    paintImage(card, null);
-    fitContent(card);
-  };
-  if (node.getAttribute("src") !== image.url) node.src = image.url;
-  node.alt = image.alt;
-  node.title = `Image source: ${image.source}`;
-  const link = credit ?? card.appendChild(Object.assign(element("a", "image-credit"), { target: "_blank", rel: "noreferrer" }));
-  link.href = image.source;
-  link.textContent = `Image: ${image.alt} · Wikimedia Commons`;
-  card.classList.add("has-image", `image-${image.placement}`);
-}
-
-// Run a one-shot highlight, restarting it if the same node changes twice in a
-// row. Reading offsetWidth between the two class changes is what makes the
-// browser treat this as a new animation rather than a continuing one.
-function flash(node, className) {
-  node.classList.remove(className);
-  void node.offsetWidth;
-  node.classList.add(className);
-  node.addEventListener("animationend", () => node.classList.remove(className), { once: true });
-}
-
-// `highlight` is off for a card being drawn for the first time: the slide is
-// already animating in as a whole, and marking up every bullet inside it would
-// say "all of this is new" when nothing here has changed yet.
-function paintBullets(list, bullets, highlight) {
-  const items = [...list.children];
-  bullets.forEach((bullet, rank) => {
-    const item = items[rank];
-    if (!item) {
-      const added = element("li", "", bullet);
-      list.append(added);
-      if (highlight) flash(added, "is-added");
-    } else if (item.textContent !== bullet) {
-      item.textContent = bullet;
-      if (highlight) flash(item, "is-changed");
-    }
-  });
-  items.slice(bullets.length).forEach(item => item.remove());
-}
-
-// Live speech produces titles and bullets of unpredictable length, so the type
-// scale alone cannot guarantee a fit. Measure what was actually laid out and
-// shrink the text block about its left edge until it clears the padding box.
-const MIN_FIT = 0.45;
-function fitContent(card) {
-  const content = card.querySelector(".slide-content");
-  if (!content || !card.clientHeight) return;
-  content.style.transform = "";
-  const style = getComputedStyle(card);
-  const available = card.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-  const natural = content.scrollHeight;
-  if (natural > available) {
-    content.style.transform = `scale(${Math.max(MIN_FIT, available / natural).toFixed(4)})`;
-  }
-}
-
-function fitAll() {
-  slides.querySelectorAll(".slide").forEach(fitContent);
-}
-
-function newCard(key) {
-  const card = element("article", "slide is-new");
-  // A new card gets one entrance animation only. Subsequent edits and manual
-  // navigation must remain visually still.
-  card.addEventListener("animationend", () => card.classList.remove("is-new"), { once: true });
-  card.dataset.slide = key;
-  card.append(element("div", "slide-number"));
-  const content = element("div", "slide-content");
-  content.append(element("h2"), element("ul"));
-  card.append(content);
-  return card;
-}
-
-function render(deck) {
-  // The destination belongs in the fingerprint. Leaving it out lets a poll that
-  // only moves the selection compare equal to the last one and return early,
-  // which is the deck refusing to advance to a slide it has already drawn.
-  const fingerprint = JSON.stringify([deck.active_slide_id, deck.slides]);
-  if (fingerprint === previous) return;
-  previous = fingerprint;
-  // Recorded before any select() below, because that is what decides whether the
-  // viewer is still watching the slide being written.
-  deckActiveId = deck.active_slide_id ?? null;
-
-  if (!deck.slides.length) {
-    if (!slides.querySelector(".empty")) slides.replaceChildren(element("div", "empty", "Listening for a topic..."));
-    select(0);
-    return;
-  }
-  slides.querySelector(".empty")?.remove();
-
-  const drawn = [...slides.querySelectorAll(".slide")];
-  // Which slide the viewer is on, read before the rebuild reorders anything.
-  // Positions shift when the title slide is inserted at the front, so holding
-  // the index across a render would quietly move the viewer one slide back.
-  const heldId = drawn[activeIndex]?.dataset.slide ?? null;
-  const existing = new Map(drawn.map(card => [card.dataset.slide, card]));
-  // Drop deleted slides first so the surviving cards already sit at the indices
-  // the loop below compares against.
-  const wanted = new Set(deck.slides.map(slide => String(slide.id)));
-  existing.forEach((card, key) => {
-    if (!wanted.has(key)) {
-      card.remove();
-      existing.delete(key);
-    }
-  });
-  // A slide id the page has never drawn is one that was just created, and that
-  // holds however it was created. Ids only ever increase, so the largest unseen
-  // id is the newest slide -- which is not the last position, because the title
-  // slide is inserted at the front.
-  let createdIndex = -1;
-  let createdId = -Infinity;
-  deck.slides.forEach((slide, index) => {
-    const key = String(slide.id);
-    const fresh = !shown.has(key);
-    const card = existing.get(key) ?? newCard(key);
-    if (fresh) {
-      shown.add(key);
-      if (Number(slide.id) > createdId) {
-        createdId = Number(slide.id);
-        createdIndex = index;
-      }
-    }
-    card.classList.toggle("title-slide", slide.kind === "title");
-    const label = `SLIDE ${String(slide.number).padStart(2, "0")}`;
-    const number = card.querySelector(".slide-number");
-    if (number.textContent !== label) number.textContent = label;
-    const title = card.querySelector("h2");
-    if (title.textContent !== slide.title) {
-      title.textContent = slide.title;
-      if (!fresh) flash(title, "is-changed");
-    }
-    paintBullets(card.querySelector("ul"), slide.bullets, !fresh);
-    paintImage(card, slide.image);
-    // Re-inserting a node that is already in place still removes and reinserts
-    // it, which restarts every animation running inside it. Only move a card
-    // that is genuinely out of order.
-    if (slides.children[index] !== card) slides.insertBefore(card, slides.children[index] ?? null);
-  });
-  fitAll();
-  // Where the deck puts the viewer, in order of authority:
-  //   1. active_slide_id, whenever a slide has just appeared or the backend has
-  //      moved the pointer since we last followed it. The slide being written is
-  //      the one to watch, and it is not always the newest: a title slide that
-  //      arrives after the first content slide is inserted at the front while
-  //      the bullets keep landing on the content slide. Jumping to the title
-  //      there parked the viewer on it and made stepping forward to the live
-  //      slide look like browsing away, which paused the recorder.
-  //   2. a slide that has just appeared, when the deck names no destination
-  //      (an older publisher). Seeing it for the first time is the evidence
-  //      something was created.
-  //   3. otherwise nobody created anything, so leave a manual selection alone,
-  //      holding the slide by id because an insert at the front shifts indices.
-  const destination = deck.slides.findIndex(slide => String(slide.id) === String(deck.active_slide_id));
-  const pointerMoved = String(deck.active_slide_id) !== String(followedSlideId);
-  if (destination !== -1 && (createdIndex !== -1 || pointerMoved)) {
-    followedSlideId = deck.active_slide_id;
-    select(destination);
-  } else if (createdIndex !== -1) {
-    followedSlideId = deck.active_slide_id; // stay in step so rule 1 cannot bounce us
-    select(createdIndex);
-  } else {
-    const held = deck.slides.findIndex(slide => String(slide.id) === heldId);
-    select(held === -1 ? activeIndex : held);
-  }
-}
-
-function sendCommand(name) {
-  return fetch("/api/command", { method: "POST", body: name });
-}
-
-// Browsing back stops the deck being written underneath you, and returning to
-// the live slide starts it again. Only a pause this page asked for is lifted
-// here: if the speaker paused from the hardware button, that stands.
-let viewerHeldPause = false;
-function syncRecording() {
-  if (deckActiveId === null || !slides.querySelector(".slide")) return;
-  const cards = [...slides.querySelectorAll(".slide")];
-  const onLiveSlide = cards[activeIndex]?.dataset.slide === String(deckActiveId);
-  if (!onLiveSlide && !viewerHeldPause) {
-    viewerHeldPause = true;
-    sendCommand("CMD_PAUSE_ON").catch(() => { viewerHeldPause = false; });
-  } else if (onLiveSlide && viewerHeldPause) {
-    viewerHeldPause = false;
-    sendCommand("CMD_PAUSE_OFF").catch(() => {});
-  }
-}
-
-async function createNextSlide() {
-  try {
-    const response = await sendCommand("CMD_NEXT");
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const deck = await response.json();
-    render(deck); // active_slide_id immediately selects the blank destination
-    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
-  } catch (_) {
-    // A hosted, view-only display has no recorder to control.
-  }
-}
-
-// Walk forward through the slides that exist; at the end of the deck, start the
-// one the speaker is about to talk to.
-function advance() {
-  if (activeIndex < slides.querySelectorAll(".slide").length - 1) {
-    select(activeIndex + 1);
-    return;
-  }
-  createNextSlide();
-}
-
-// select() decides whether to pause, so navigation no longer says so itself.
-previousButton.addEventListener("click", () => select(activeIndex - 1));
-nextButton.addEventListener("click", advance);
-document.addEventListener("keydown", event => {
-  if (["ArrowLeft", "ArrowUp"].includes(event.key)) {
-    select(activeIndex - 1);
-  }
-  if (["ArrowRight", "ArrowDown", " "].includes(event.key)) {
-    event.preventDefault();
-    advance();
-  }
-});
-
-async function refresh() {
-  try {
-    // Without a deadline a hosted API that hangs rather than refuses would leave
-    // the page claiming LIVE indefinitely.
-    const response = await fetch("/api/slides", { cache: "no-store", signal: AbortSignal.timeout(4000) });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const deck = await response.json();
-    // A remote publisher can briefly expose an older completed upload after a
-    // newer one. Never let that make a newly created slide disappear again.
-    if (Number.isFinite(deck.version) && deck.version < latestDeckVersion) return;
-    if (Number.isFinite(deck.version)) latestDeckVersion = deck.version;
-    render(deck);
-    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
-  } catch (error) {
-    statusLabel.textContent = "RECONNECTING";
-  }
-}
-new ResizeObserver(fitAll).observe(slides);
-document.fonts?.ready.then(fitAll);
-refresh();
-setInterval(refresh, 500);
-</script>
+<header><h1>SLIDEX</h1><a href="https://github.com/adntaha/slidex" target="_blank" rel="noreferrer">Source</a></header>
+<main>
+  <section class="hero">
+    <h2>Talk. The slides write themselves.</h2>
+    <p class="lede">SlideX listens while you speak and builds the deck as you go — titles, bullets, and a picture for every slide — so you never turn your back on the room.</p>
+    <a class="start" href="/deck"><span class="dot" aria-hidden="true"></span>Start presenting</a>
+    <div class="features" aria-label="What SlideX does">
+      <div class="feature"><h3>Live from speech</h3><p>The deck follows the talk: a new subject opens a new slide, and the slide being written stays on screen.</p></div>
+      <div class="feature"><h3>Illustrated as it goes</h3><p>Each slide is illustrated from Wikimedia Commons, credited on the slide, and never repeats a picture already on the deck.</p></div>
+      <div class="feature"><h3>Saved when you reset</h3><p>Pressing reset clears the deck and writes the finished talk to a single PDF in the <code>exports</code> folder.</p></div>
+    </div>
+    <p class="hint">START SLIDEX.PY WITH --WEB · THE DECK PAGE SAYS "LISTENING FOR A TOPIC..." UNTIL YOU SPEAK</p>
+  </section>
+</main>
 </body>
 </html>

@@ -2,7 +2,7 @@
 
 Audio streams to the OpenAI Realtime API, which edits the in-memory deck by
 calling the local tools in ``TOOL_HANDLERS``. A tiny HTTP server publishes the
-deck to ``index.html``, which polls it and animates the changes.
+deck to ``deck.html``, which polls it and animates the changes.
 
 Set OPENAI_API_KEY, then run:
     pipenv run python slidex.py --microphone --web
@@ -708,6 +708,9 @@ class DeckRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/":
             body = (Path(__file__).parent / "public" / "index.html").read_bytes()
             self._send(200, "text/html; charset=utf-8", body)
+        elif self.path in ("/deck", "/deck.html"):
+            body = (Path(__file__).parent / "public" / "deck.html").read_bytes()
+            self._send(200, "text/html; charset=utf-8", body)
         elif self.path == "/api/slides":
             body = json.dumps(deck_snapshot()).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
@@ -744,6 +747,40 @@ class DeckRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         # Browser polling should not swamp the useful microphone/tool trace output.
         return
+
+
+EXPORTS_DIR = Path(__file__).parent / "exports"
+
+
+def wipe_deck() -> None:
+    """Clear the deck, first writing what was on it to a PDF in exports/.
+
+    The reset is the end of a talk, and a talk cannot be given again -- so the
+    deck is saved before it goes. The export downloads every slide picture and
+    so runs on its own thread; the deck itself is cleared at once. The thread is
+    not a daemon: a Ctrl-C right after the reset must not lose the file.
+    """
+    with DECK_LOCK:
+        snapshot = deck_snapshot()
+        SLIDES.clear()
+        mark_deck_changed()
+    if not snapshot["slides"]:
+        return
+
+    def export() -> None:
+        try:
+            from deck_pdf import export_deck  # reportlab is only needed here
+        except ImportError:
+            trace("EXPORT SKIPPED: run `pipenv install` to get reportlab, which writes the PDF.")
+            return
+        try:
+            path = export_deck(snapshot, EXPORTS_DIR)
+        except Exception as exc:  # noqa: BLE001 - a failed export must never take the recorder down
+            trace(f"EXPORT FAILED: {exc}")
+            return
+        trace(f"EXPORTED {len(snapshot['slides'])} slide(s) to {path}")
+
+    threading.Thread(target=export, name="deck-export").start()
 
 
 def start_web_server(port: int) -> ThreadingHTTPServer:
@@ -1682,9 +1719,7 @@ def deck_command_handler(stream: TranscriptStream, state: dict[str, Any],
 
     def handle(command: str) -> None:
         if command == "CMD_WIPE":
-            with DECK_LOCK:
-                SLIDES.clear()
-                mark_deck_changed()
+            wipe_deck()
             stream.discard_pending()
             close_current_slide()
             trace("COMMAND CMD_WIPE: deck cleared.")

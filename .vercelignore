@@ -5,6 +5,8 @@
 # root main.py/app.py/index.py/server.py as the app entrypoint and fails the
 # build when it does not export `app` or `handler`.
 slidex.py
+deck_pdf.py
+exports
 tools
 Pipfile
 Pipfile.lock

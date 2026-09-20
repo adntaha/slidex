@@ -1,2 +1,4 @@
 __pycache__
 .env
+# PDFs written when the deck is reset; each talk's own record, not the project's.
+exports/
