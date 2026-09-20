@@ -94,7 +94,7 @@ IMAGE_SEARCH_TIMEOUT = 12
 # hit repeated; a search with fewer results than that falls back to a random
 # pick from this many.
 IMAGE_CANDIDATES = 10
-IMAGE_QUERY_MODEL = "gpt-4.1-mini"  # a naming task, and it runs off the critical path
+IMAGE_QUERY_MODEL = "gpt-4.1-mini"  # a naming task
 IMAGE_QUERY_TIMEOUT = 12
 
 IMAGE_QUERY_SYSTEM = (
