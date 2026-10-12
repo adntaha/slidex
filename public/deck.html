@@ -71,6 +71,11 @@ li::before{content:"\2022";color:#4285f4;font-size:1.3em;line-height:.8}
 button{width:34px;height:34px;border:0;border-radius:50%;background:transparent;color:#3c4043;cursor:pointer;font-size:1.4rem}
 button:hover:not(:disabled){background:#f1f3f4}
 button:disabled{color:#bdc1c6;cursor:default}
+.header-actions{display:flex;align-items:center;gap:14px}
+#clear-deck{width:28px;height:28px;display:grid;place-items:center;border:1px solid #dadce0;border-radius:5px;color:#80868b}
+#clear-deck:disabled{opacity:.4}
+#clear-deck:focus-visible{outline:2px solid #5f6368;outline-offset:3px}
+#clear-deck svg{width:16px;height:16px}
 #position{min-width:54px;color:#5f6368;font:.75rem "Courier New",monospace;text-align:center}
 
 @keyframes slide-in{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
@@ -92,7 +97,17 @@ button:disabled{color:#bdc1c6;cursor:default}
 </style>
 </head>
 <body>
-<header><h1>SlideX</h1><p id="status">CONNECTING</p></header>
+<header>
+  <h1>SlideX</h1>
+  <div class="header-actions">
+    <p id="status">CONNECTING</p>
+    <button id="clear-deck" type="button" aria-label="Export PDF and clear deck" title="Export PDF and clear deck" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/>
+      </svg>
+    </button>
+  </div>
+</header>
 <div id="stage"><main id="slides"><div class="empty">Listening for a topic...</div></main></div>
 <nav id="controls" aria-label="Presentation controls">
   <button id="previous" aria-label="Previous slide">‹</button>
@@ -104,7 +119,9 @@ const slides = document.getElementById("slides");
 const statusLabel = document.getElementById("status");
 const previousButton = document.getElementById("previous");
 const nextButton = document.getElementById("next");
+const clearButton = document.getElementById("clear-deck");
 const counter = document.getElementById("position");
+let clearingDeck = false;
 
 let previous = ""; // fingerprint of the deck as last drawn
 let activeIndex = 0;
@@ -231,6 +248,7 @@ function newCard(key) {
 }
 
 function render(deck) {
+  clearButton.disabled = clearingDeck || !deck.slides.length;
   // The destination belongs in the fingerprint. Leaving it out lets a poll that
   // only moves the selection compare equal to the last one and return early,
   // which is the deck refusing to advance to a slide it has already drawn.
@@ -328,6 +346,24 @@ function sendCommand(name) {
   return fetch("/api/command", { method: "POST", body: name });
 }
 
+clearButton.addEventListener("click", async () => {
+  if (clearingDeck) return;
+  clearingDeck = true;
+  clearButton.disabled = true;
+  try {
+    const response = await sendCommand("CMD_WIPE");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const deck = await response.json();
+    render(deck);
+    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
+  } catch (_) {
+    alert("Could not export and clear the deck. Use the local deck on the PC running the recorder and check that it is connected.");
+  } finally {
+    clearingDeck = false;
+    clearButton.disabled = !slides.querySelector(".slide");
+  }
+});
+
 // Browsing back stops the deck being written underneath you, and returning to
 // the live slide starts it again. Only a pause this page asked for is lifted
 // here: if the speaker paused from the hardware button, that stands.
@@ -371,6 +407,7 @@ function advance() {
 previousButton.addEventListener("click", () => select(activeIndex - 1));
 nextButton.addEventListener("click", advance);
 document.addEventListener("keydown", event => {
+  if (event.target.closest("button")) return;
   if (["ArrowLeft", "ArrowUp"].includes(event.key)) {
     select(activeIndex - 1);
   }

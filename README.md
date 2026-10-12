@@ -10,7 +10,13 @@ slides are illustrated automatically from Wikimedia Commons.
 ```bash
 pipenv install
 # add env vars to .env
+
+# with the esp32:
 pipenv run python slidex.py --transcribe --esp32 --web --push https://slidex-hackmit-2026-one.vercel.app/api/slides
+# without the esp32:
+pipenv run python slidex.py --transcribe --commands-port 0 --web --push https://slidex-hackmit-2026-one.vercel.app/api/slides
+
+# replace "slidex-hackmit-2026-one.vercel.app" with your own publicly accessible host
 ```
 
 Then open <http://127.0.0.1:8000>: a landing page whose **Start presenting**
