@@ -14,6 +14,8 @@ header{height:54px;padding:0 22px;display:flex;align-items:center;justify-conten
 h1,h2,p{margin:0}
 h1{color:#5f6368;font-size:.78rem;letter-spacing:.08em}
 #status{color:#188038;font:700 .7rem "Courier New",monospace}
+#status[data-offline="true"]{color:#9a6700}
+#recorder-notice{padding:12px 22px;border-bottom:1px solid #ead9ad;background:#fff8e6;color:#795500;font-size:.85rem;line-height:1.4}
 #stage{min-height:calc(100vh - 54px);padding:clamp(18px,4vh,46px) clamp(14px,6vw,96px) 76px;display:grid;place-items:center}
 main{container-type:size;container-name:frame;width:min(100%,1240px);aspect-ratio:16/9;position:relative;background:#fff;box-shadow:0 3px 15px #2021242b;overflow:hidden}
 .empty{width:100%;height:100%;display:grid;place-items:center;color:#5f6368;font-size:clamp(1.2rem,3cqw,2.2rem)}
@@ -100,7 +102,7 @@ button:disabled{color:#bdc1c6;cursor:default}
 <header>
   <h1>SlideX</h1>
   <div class="header-actions">
-    <p id="status">CONNECTING</p>
+    <p id="status" role="status">CONNECTING</p>
     <button id="clear-deck" type="button" aria-label="Export PDF and clear deck" title="Export PDF and clear deck" disabled>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5"/>
@@ -108,6 +110,7 @@ button:disabled{color:#bdc1c6;cursor:default}
     </button>
   </div>
 </header>
+<p id="recorder-notice" role="status" hidden></p>
 <div id="stage"><main id="slides"><div class="empty">Listening for a topic...</div></main></div>
 <nav id="controls" aria-label="Presentation controls">
   <button id="previous" aria-label="Previous slide">‹</button>
@@ -117,11 +120,28 @@ button:disabled{color:#bdc1c6;cursor:default}
 <script>
 const slides = document.getElementById("slides");
 const statusLabel = document.getElementById("status");
+const recorderNotice = document.getElementById("recorder-notice");
 const previousButton = document.getElementById("previous");
 const nextButton = document.getElementById("next");
 const clearButton = document.getElementById("clear-deck");
 const counter = document.getElementById("position");
 let clearingDeck = false;
+let recorderConnected = false;
+
+function updateRecorderStatus(deck, failed = false) {
+  recorderConnected = !failed && deck.recorder_connected === true;
+  statusLabel.dataset.offline = String(!recorderConnected);
+  statusLabel.textContent = failed ? "CONNECTION UNAVAILABLE" : !recorderConnected
+    ? "NO RECORDER CONNECTED" : deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
+  recorderNotice.hidden = recorderConnected;
+  recorderNotice.textContent = failed
+    ? "Cannot reach SlideX to check the recorder connection. Retrying automatically."
+    : "No recorder connected. Start SlideX on the presenting computer to go live. Any saved slides remain available below.";
+  const empty = slides.querySelector(".empty");
+  if (empty) empty.textContent = recorderConnected ? "Listening for a topic..."
+    : failed ? "Waiting for a connection..." : "Waiting for a recorder...";
+  clearButton.disabled = !recorderConnected || clearingDeck || !slides.querySelector(".slide");
+}
 
 let previous = ""; // fingerprint of the deck as last drawn
 let activeIndex = 0;
@@ -248,7 +268,7 @@ function newCard(key) {
 }
 
 function render(deck) {
-  clearButton.disabled = clearingDeck || !deck.slides.length;
+  clearButton.disabled = !recorderConnected || clearingDeck || !deck.slides.length;
   // The destination belongs in the fingerprint. Leaving it out lets a poll that
   // only moves the selection compare equal to the last one and return early,
   // which is the deck refusing to advance to a slide it has already drawn.
@@ -355,12 +375,12 @@ clearButton.addEventListener("click", async () => {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const deck = await response.json();
     render(deck);
-    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
+    updateRecorderStatus(deck);
   } catch (_) {
     alert("Could not export and clear the deck. Use the local deck on the PC running the recorder and check that it is connected.");
   } finally {
     clearingDeck = false;
-    clearButton.disabled = !slides.querySelector(".slide");
+    clearButton.disabled = !recorderConnected || !slides.querySelector(".slide");
   }
 });
 
@@ -387,7 +407,7 @@ async function createNextSlide() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const deck = await response.json();
     render(deck); // active_slide_id immediately selects the blank destination
-    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
+    updateRecorderStatus(deck);
   } catch (_) {
     // A hosted, view-only display has no recorder to control.
   }
@@ -429,9 +449,9 @@ async function refresh() {
     if (Number.isFinite(deck.version) && deck.version < latestDeckVersion) return;
     if (Number.isFinite(deck.version)) latestDeckVersion = deck.version;
     render(deck);
-    statusLabel.textContent = deck.paused ? "LIVE / PAUSED" : "LIVE / LISTENING";
+    updateRecorderStatus(deck);
   } catch (error) {
-    statusLabel.textContent = "RECONNECTING";
+    updateRecorderStatus(null, true);
   }
 }
 new ResizeObserver(fitAll).observe(slides);

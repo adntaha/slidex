@@ -238,6 +238,7 @@ def deck_snapshot() -> dict[str, Any]:
     with DECK_LOCK:
         return {
             "version": DECK_VERSION,
+            "recorder_connected": True,
             "paused": DECK_PAUSED.is_set(),
             "active_slide_id": active_slide_id(),
             "slides": [
@@ -793,7 +794,7 @@ def start_web_server(port: int) -> ThreadingHTTPServer:
 def start_deck_publisher(endpoint: str, token: str, interval: float = 0.4) -> threading.Event:
     """Mirror the deck to a hosted display for viewers who are not on this machine.
 
-    Polls the local snapshot and POSTs only when it changes. This runs on its own
+    POSTs changes plus a heartbeat every five seconds. This runs on its own
     thread on purpose: the upload must never sit in front of the Realtime event
     loop, and coalescing here keeps a burst of edits to a single request.
     """
@@ -801,9 +802,10 @@ def start_deck_publisher(endpoint: str, token: str, interval: float = 0.4) -> th
 
     def publish() -> None:
         published: bytes | None = None
+        last_published = 0.0
         while not stop.wait(interval):
             body = json.dumps(deck_snapshot()).encode()
-            if body == published:
+            if body == published and time.monotonic() - last_published < 5:
                 continue
             request = Request(
                 endpoint,
@@ -818,6 +820,7 @@ def start_deck_publisher(endpoint: str, token: str, interval: float = 0.4) -> th
                 trace(f"PUSH FAILED: {exc}")
                 continue
             published = body
+            last_published = time.monotonic()
 
     threading.Thread(target=publish, daemon=True, name="deck-publisher").start()
     trace(f"Publishing the deck to {endpoint}")

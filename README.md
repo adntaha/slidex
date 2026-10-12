@@ -83,8 +83,10 @@ pipenv run python slidex.py --microphone --web --push https://your-app.vercel.ap
 ```
 
 `--web` stays useful as your own local monitor; `--push` mirrors the deck for
-the audience. A publisher thread diffs the snapshot and uploads only on change,
-off the Realtime event loop.
+the audience. A publisher thread uploads changes and sends a heartbeat every
+five seconds, off the Realtime event loop. The landing page and deck show
+**No recorder connected** after 15 seconds without a heartbeat; saved slides
+remain available. Silence and pausing do not disconnect the recorder.
 
 | Route | |
 | --- | --- |

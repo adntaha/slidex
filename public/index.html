@@ -30,6 +30,8 @@ h2{font-size:clamp(2rem,5.2vw,4.2rem);line-height:.98;letter-spacing:-.04em;font
 .feature p{color:#5f6368;font-size:clamp(.78rem,1vw,.9rem);line-height:1.4}
 code{font-family:"Courier New",monospace;font-size:.95em}
 .hint{color:#5f6368;font:.72rem "Courier New",monospace;letter-spacing:.04em}
+#recorder-status{max-width:54ch;padding:10px 16px;border:1px solid #ead9ad;border-radius:8px;background:#fff8e6;color:#795500;font-size:.85rem;line-height:1.4}
+#recorder-status[data-connected="true"]{border-color:#ceead6;background:#e6f4ea;color:#188038}
 @media (max-width:640px){.features{grid-template-columns:1fr}.feature p{display:none}}
 @media (max-height:520px){.features{display:none}}
 </style>
@@ -41,6 +43,7 @@ code{font-family:"Courier New",monospace;font-size:.95em}
     <h2>Talk. The slides write themselves.</h2>
     <p class="lede">SlideX listens while you speak and builds the deck as you go, with titles, bullets, and a picture for every slide. You never have to turn your back on the room.</p>
     <a class="start" href="/deck"><span class="dot" aria-hidden="true"></span>Start presenting</a>
+    <p id="recorder-status" role="status">Checking recorder connection…</p>
     <div class="features" aria-label="What SlideX does">
       <div class="feature"><h3>Live from speech</h3><p>The deck follows the talk: a new subject opens a new slide, and the slide being written stays on screen.</p></div>
       <div class="feature"><h3>Illustrated as it goes</h3><p>Each slide is illustrated from Wikimedia Commons, credited on the slide, and never repeats a picture already on the deck.</p></div>
@@ -49,5 +52,25 @@ code{font-family:"Courier New",monospace;font-size:.95em}
     <p class="hint">Made by Alivia, Aidan, Esim, and Rory. Running on caffeine and sleep deprivation.</p>
   </section>
 </main>
+<script>
+const recorderStatus = document.getElementById("recorder-status");
+async function checkRecorder() {
+  try {
+    const response = await fetch("/api/slides", { cache: "no-store", signal: AbortSignal.timeout(4000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const deck = await response.json();
+    const connected = deck.recorder_connected === true;
+    recorderStatus.dataset.connected = String(connected);
+    recorderStatus.textContent = connected ? "Recorder connected — ready to present."
+      : "No recorder connected. Start SlideX on the presenting computer to go live. You can still open saved slides.";
+  } catch (_) {
+    recorderStatus.dataset.connected = "false";
+    recorderStatus.textContent = "Cannot check the recorder connection. Retrying automatically.";
+  } finally {
+    setTimeout(checkRecorder, 5000);
+  }
+}
+checkRecorder();
+</script>
 </body>
 </html>

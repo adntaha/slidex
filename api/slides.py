@@ -21,6 +21,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import time
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.request import Request, urlopen
@@ -29,6 +30,7 @@ DECK_KEY = "slidex:deck"
 EMPTY_DECK: dict[str, Any] = {"slides": []}
 KV_TIMEOUT = 5
 MAX_BODY_BYTES = 1_000_000
+RECORDER_TIMEOUT = 15  # three missed five-second heartbeats
 
 _fallback: dict[str, str] = {}
 
@@ -82,15 +84,23 @@ def deck_version(deck: dict[str, Any]) -> int:
 
 
 def write_deck(deck: dict[str, Any]) -> bool:
-    """Store a snapshot unless a newer publisher has already won."""
-    if deck_version(deck) < deck_version(read_deck()):
-        return False
-    raw = json.dumps(deck)
+    """Record publisher presence, retaining the newest deck content."""
+    current = read_deck()
+    accepted = deck_version(deck) >= deck_version(current)
+    snapshot = dict(deck if accepted else current)
+    # Use receipt time so the recorder's clock cannot affect its online status.
+    snapshot["recorder_seen_at"] = time.time()
+    raw = json.dumps(snapshot)
     if credentials() is None:
         _fallback[DECK_KEY] = raw
-        return True
+        return accepted
     kv_command("SET", DECK_KEY, raw)
-    return True
+    return accepted
+
+
+def recorder_connected(deck: dict[str, Any]) -> bool:
+    seen = deck.get("recorder_seen_at")
+    return isinstance(seen, (int, float)) and 0 <= time.time() - seen < RECORDER_TIMEOUT
 
 
 class handler(BaseHTTPRequestHandler):  # noqa: N801 - name required by the Vercel Python runtime
@@ -101,7 +111,7 @@ class handler(BaseHTTPRequestHandler):  # noqa: N801 - name required by the Verc
             # A 503 leaves the page showing RECONNECTING rather than an empty deck.
             self._send(503, {"error": str(exc)})
             return
-        self._send(200, deck)
+        self._send(200, {**deck, "recorder_connected": recorder_connected(deck)})
 
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         # Read the body before anything else. Answering a request without
